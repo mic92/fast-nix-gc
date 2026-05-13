@@ -1,4 +1,4 @@
-//! Benchmarks for fast-gc using a synthetic Nix store.
+//! Benchmarks for fast-nix-gc using a synthetic Nix store.
 //!
 //! Creates a fake store with configurable number of paths and reference
 //! density, then measures root finding, closure computation, and full
@@ -100,7 +100,7 @@ impl BenchStore {
     }
 
     fn run_gc(&self, extra_args: &[&str]) -> std::process::Output {
-        let bin = env!("CARGO_BIN_EXE_fast-gc");
+        let bin = env!("CARGO_BIN_EXE_fast-nix-gc");
         Command::new(bin)
             .arg("--store-dir")
             .arg(&self.store_dir)
@@ -132,7 +132,7 @@ fn bench_run(label: &str, iterations: u32, f: impl Fn()) {
 }
 
 fn main() {
-    println!("=== fast-gc benchmarks ===\n");
+    println!("=== fast-nix-gc benchmarks ===\n");
 
     // Small store: 1000 paths, 10 roots, 3 refs each
     // ~500 alive (roots + transitive closure), ~500 dead

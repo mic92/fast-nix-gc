@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a synthetic Nix store for profiling fast-gc."""
+"""Build a synthetic Nix store for profiling fast-nix-gc."""
 
 import os
 import sqlite3

@@ -24,7 +24,7 @@ fn parse_args() -> Result<Args> {
     let mut pargs = pico_args::Arguments::from_env();
 
     if pargs.contains("--help") {
-        eprintln!("Usage: fast-gc [OPTIONS]");
+        eprintln!("Usage: fast-nix-gc [OPTIONS]");
         eprintln!();
         eprintln!("Options:");
         eprintln!("  -d, --delete-old             Remove old profile generations");

@@ -1,10 +1,10 @@
-# fast-gc
+# fast-nix-gc
 
 A faster `nix-collect-garbage`.
 
 The stock GC issues one SQLite query per store path while traversing the
 reference graph. With ~100K paths this means ~100K B-tree seeks and a lot
-of statement-cache churn. fast-gc instead reads `ValidPaths` and `Refs`
+of statement-cache churn. fast-nix-gc instead reads `ValidPaths` and `Refs`
 once into a CSR adjacency list and runs the liveness BFS over integer node
 ids. On a real store with ~30K dead paths this brings the dry-run from
 ~20s down to ~1s. Disk deletion and `.links` cleanup are parallelized
@@ -13,7 +13,7 @@ with rayon.
 ## Usage
 
 ```
-fast-gc [OPTIONS]
+fast-nix-gc [OPTIONS]
 
   -d, --delete-old              Remove old profile generations
       --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d, 4h)

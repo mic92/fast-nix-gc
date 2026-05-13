@@ -12,7 +12,7 @@
         in
         {
           default = pkgs.rustPlatform.buildRustPackage {
-            pname = "fast-gc";
+            pname = "fast-nix-gc";
             version = "0.1.0";
             src = ./.;
             cargoHash = "sha256-CmS7qn+tl/363RhgchZcm94qahCVPOT3fluhp+AyTNI=";

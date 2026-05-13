@@ -122,7 +122,7 @@ impl TestStore {
     }
 
     fn run_gc(&self, extra_args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_fast-gc"))
+        Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
             .arg("--store-dir")
             .arg(&self.store_dir)
             .arg("--state-dir")
@@ -248,7 +248,7 @@ fn gc_keeps_runtime_roots_from_open_fd() {
     // own /proc/<pid>/fd. Sandboxes can't always inspect other PIDs.
     let f = fs::File::open(held.path.join("file")).unwrap();
     let raw_fd = f.as_raw_fd();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fast-gc"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"));
     cmd.arg("--store-dir")
         .arg(&store.store_dir)
         .arg("--state-dir")
@@ -282,7 +282,7 @@ fn gc_keeps_runtime_roots_from_environ() {
     let trash = store.add_path("trash", 100);
 
     // Pin via the child's environment, scanned from /proc/<pid>/environ.
-    let out = Command::new(env!("CARGO_BIN_EXE_fast-gc"))
+    let out = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
         .arg("--store-dir")
         .arg(&store.store_dir)
         .arg("--state-dir")

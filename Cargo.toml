@@ -33,3 +33,8 @@ codegen-units = 1
 inherits = "release"
 debug = true
 strip = false
+
+[package]
+name = "fast-nix-gc"
+version = "0.1.0"
+edition = "2024"
