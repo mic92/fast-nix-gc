@@ -18,6 +18,16 @@ log = { version = "0.4", features = ["std"] }
 rusqlite = "0.39"
 foldhash = "0.2"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+futures-util = "0.3"
+harmonia-nar = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
+
+# harmonia-nar/-hash declare their intra-workspace deps as bare version reqs;
+# patch them to the same git rev so cargo can resolve them outside that workspace.
+[patch.crates-io]
+harmonia-utils-io            = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
+harmonia-utils-base-encoding = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
 
 [profile.release]
 

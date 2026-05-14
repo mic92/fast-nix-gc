@@ -12,9 +12,14 @@ fast-nix-common.workspace = true
 anyhow.workspace = true
 log.workspace = true
 pico-args.workspace = true
-rayon.workspace = true
 nix.workspace = true
 walkdir.workspace = true
+foldhash.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+harmonia-nar.workspace = true
+harmonia-utils-hash.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rusqlite.workspace = true
