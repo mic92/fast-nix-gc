@@ -63,21 +63,24 @@ impl NixDb {
 
         let mut paths: Vec<String> = Vec::new();
         let mut nar_sizes: Vec<u64> = Vec::new();
+        let mut registration_times: Vec<i64> = Vec::new();
         {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, path, narSize FROM ValidPaths")?;
+                .prepare("SELECT id, path, narSize, registrationTime FROM ValidPaths")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let id: i64 = row.get(0)?;
                 let path: String = row.get(1)?;
                 let nar: Option<i64> = row.get(2)?;
+                let reg_time: i64 = row.get(3)?;
                 let idx = paths.len() as u32;
                 if (id as usize) < id_to_idx.len() {
                     id_to_idx[id as usize] = idx;
                 }
                 paths.push(path);
                 nar_sizes.push(nar.unwrap_or(0).max(0) as u64);
+                registration_times.push(reg_time);
             }
         }
 
@@ -150,6 +153,7 @@ impl NixDb {
         Ok(StoreGraph {
             paths,
             nar_sizes,
+            registration_times,
             ref_offsets,
             ref_targets,
             store_prefix: format!("{}/", self.store_dir.display()),
@@ -206,6 +210,8 @@ pub struct StoreGraph {
     pub paths: Vec<String>,
     /// node idx -> narSize (bytes)
     pub nar_sizes: Vec<u64>,
+    /// node idx -> registrationTime (Unix epoch seconds)
+    pub registration_times: Vec<i64>,
     /// CSR row offsets: refs of node i are ref_targets[ref_offsets[i]..ref_offsets[i+1]]
     pub ref_offsets: Vec<u32>,
     /// CSR column indices: flat array of referenced node idxs

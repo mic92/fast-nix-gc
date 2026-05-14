@@ -8,6 +8,7 @@ struct Args {
     delete_older_than: Option<String>,
     dry_run: bool,
     min_free: Option<u64>,
+    keep_recent: Option<String>,
     store_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -44,6 +45,7 @@ fn parse_args() -> Result<Args> {
         eprintln!("      --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d)");
         eprintln!("      --dry-run                 Show what would be done");
         eprintln!("      --min-free SIZE           Free until SIZE is available (e.g. 50G)");
+        eprintln!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
         eprintln!("      --store-dir PATH          Nix store directory [default: /nix/store]");
         eprintln!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
         std::process::exit(0);
@@ -58,6 +60,7 @@ fn parse_args() -> Result<Args> {
         delete_older_than,
         dry_run: pargs.contains("--dry-run"),
         min_free: pargs.opt_value_from_fn("--min-free", parse_size)?,
+        keep_recent: pargs.opt_value_from_str("--keep-recent")?,
         store_dir: pargs
             .opt_value_from_str("--store-dir")?
             .unwrap_or_else(|| PathBuf::from("/nix/store")),
@@ -109,8 +112,24 @@ fn main() -> Result<()> {
             .try_for_each(|dir| profiles::remove_old_generations(dir, cutoff, args.dry_run))?;
     }
 
+    let keep_recent_after = args
+        .keep_recent
+        .as_deref()
+        .map(profiles::parse_older_than)
+        .transpose()?
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
+
     let store = db::NixDb::open(&args.store_dir, &args.state_dir)?;
-    let (bytes_freed, paths_deleted) = gc::collect_garbage(&store, args.dry_run, max_freed)?;
+    let opts = gc::GcOptions {
+        dry_run: args.dry_run,
+        max_freed,
+        keep_recent_after,
+    };
+    let (bytes_freed, paths_deleted) = gc::collect_garbage(&store, &opts)?;
 
     if args.dry_run {
         println!(

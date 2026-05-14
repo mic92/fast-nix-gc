@@ -105,6 +105,15 @@ impl TestStore {
             .unwrap();
     }
 
+    fn set_registration_time(&self, p: &Pkg, time: i64) {
+        self.db()
+            .execute(
+                "UPDATE ValidPaths SET registrationTime = ? WHERE path = ?",
+                rusqlite::params![time, p.full],
+            )
+            .unwrap();
+    }
+
     fn add_drv_output(&self, drv: &Pkg, output_name: &str, out: &Pkg) {
         self.db()
             .execute(
@@ -235,15 +244,46 @@ fn gc_removes_unknown_disk_entries() {
 
 #[test]
 fn gc_max_freed_stops_early() {
-    use fast_nix_gc::{db::NixDb, gc::collect_garbage};
+    use fast_nix_gc::{
+        db::NixDb,
+        gc::{GcOptions, collect_garbage},
+    };
     let store = TestStore::new();
     store.add_path("dead1", 100);
     store.add_path("dead2", 100);
 
     let nix_db = NixDb::open(&store.store_dir, &store.state_dir).unwrap();
-    let (_, deleted) = collect_garbage(&nix_db, false, Some(1)).unwrap();
+    let opts = GcOptions {
+        max_freed: Some(1),
+        ..Default::default()
+    };
+    let (_, deleted) = collect_garbage(&nix_db, &opts).unwrap();
 
     assert_eq!(deleted, 1, "should stop after one path");
+}
+
+#[test]
+fn gc_keep_recent_pins_recently_registered() {
+    use fast_nix_gc::{
+        db::NixDb,
+        gc::{GcOptions, collect_garbage},
+    };
+    let store = TestStore::new();
+
+    let old = store.add_path("old", 100);
+    let recent = store.add_path("recent", 100);
+    store.set_registration_time(&old, 1000);
+    store.set_registration_time(&recent, 5000);
+
+    let nix_db = NixDb::open(&store.store_dir, &store.state_dir).unwrap();
+    let opts = GcOptions {
+        keep_recent_after: Some(3000),
+        ..Default::default()
+    };
+    collect_garbage(&nix_db, &opts).unwrap();
+
+    assert!(!old.path.exists(), "old path should be GC'd");
+    assert!(recent.path.exists(), "recent path should survive --keep-recent");
 }
 
 #[test]

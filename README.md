@@ -19,6 +19,7 @@ fast-nix-gc [OPTIONS]
       --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d, 4h)
       --dry-run                 Show what would be done
       --min-free SIZE           Free until SIZE is available (e.g. 50G)
+      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)
       --store-dir PATH          Nix store directory [default: /nix/store]
       --state-dir PATH          Nix state directory [default: /nix/var/nix]
 ```

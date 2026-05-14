@@ -144,12 +144,18 @@ fn acquire_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
     }
 }
 
+#[derive(Default)]
+pub struct GcOptions {
+    pub dry_run: bool,
+    pub max_freed: Option<u64>,
+    /// Keep paths registered at or after this Unix timestamp.
+    pub keep_recent_after: Option<i64>,
+}
+
 /// Main GC: find roots, compute alive closure, delete dead paths.
-pub fn collect_garbage(
-    db: &NixDb,
-    dry_run: bool,
-    max_freed: Option<u64>,
-) -> Result<(u64, usize)> {
+pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
+    let dry_run = opts.dry_run;
+    let max_freed = opts.max_freed;
     // Acquire the global GC lock before anything else. Builders take a
     // shared lock when adding temp roots; holding the exclusive lock
     // ensures no new roots appear after we scan them.
@@ -181,6 +187,17 @@ pub fn collect_garbage(
             temp_root_basenames.insert(b.to_owned());
         }
     }
+    // --keep-recent: treat recently registered paths as roots.
+    if let Some(cutoff) = opts.keep_recent_after {
+        let n_before = roots.len();
+        for (i, &t) in graph.registration_times.iter().enumerate() {
+            if t >= cutoff {
+                roots.push(i as u32);
+            }
+        }
+        log::info!("{} recent paths kept", roots.len() - n_before);
+    }
+
     roots.sort_unstable();
     roots.dedup();
     log::info!("found {} roots", roots.len());
