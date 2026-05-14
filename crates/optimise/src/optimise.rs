@@ -19,6 +19,7 @@ pub struct Stats {
     pub files_linked: AtomicU64,
     pub bytes_freed: AtomicU64,
     pub files_skipped: AtomicU64,
+    pub link_enospc: AtomicU64,
 }
 
 pub struct Options {
@@ -219,9 +220,12 @@ async fn optimise_file(
                 Ok(()) => {}
                 // Lost a race to another worker.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                // ext4 dir index full; just skip dedup for this file.
+                // Either the disk is full or the .links dir hit ext4's
+                // directory index limit. Both are non-fatal: skip dedup for
+                // this file. Logged once at the end to avoid one line per
+                // file when the disk is genuinely full.
                 Err(e) if e.raw_os_error() == Some(libc_enospc()) => {
-                    log::info!("cannot link {}: {}", link_path.display(), e);
+                    stats.link_enospc.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
                 // Path GC'd between lstat and link.
@@ -470,6 +474,10 @@ pub fn cli_main() -> Result<()> {
         .build()?;
     let stats = rt.block_on(optimise_store(opts))?;
 
+    let enospc = stats.link_enospc.load(Ordering::Relaxed);
+    if enospc > 0 {
+        log::warn!("could not create {enospc} link(s): no space left on device");
+    }
     let linked = stats.files_linked.load(Ordering::Relaxed);
     let freed = stats.bytes_freed.load(Ordering::Relaxed);
     if dry {
