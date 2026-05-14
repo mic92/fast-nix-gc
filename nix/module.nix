@@ -65,8 +65,11 @@ in
     keepRecent = lib.mkOption {
       type = lib.types.nullOr lib.types.singleLineStr;
       default = null;
-      example = "7d";
-      description = "Keep store paths registered within this time window.";
+      example = "1d";
+      description = ''
+        Keep store paths registered within this time window. Avoids deleting
+        build dependencies fetched during a recent build.
+      '';
     };
 
     extraArgs = lib.mkOption {
