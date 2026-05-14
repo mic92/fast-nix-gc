@@ -191,9 +191,7 @@ pub fn collect_garbage(
     let n_alive = alive.iter().filter(|&&a| a).count();
     log::info!("{} alive paths", n_alive);
 
-    let dead: Vec<bool> = alive.iter().map(|&a| !a).collect();
-    let n_dead = graph.len() - n_alive;
-    log::info!("{} dead paths", n_dead);
+    log::info!("{} dead paths", graph.len() - n_alive);
 
     // Also find entries on disk that aren't in the DB at all.
     // Compare by basename to avoid allocating a full-path string per entry.
@@ -216,7 +214,7 @@ pub fn collect_garbage(
     }
 
     let dead_indices: Vec<u32> = (0..graph.len() as u32)
-        .filter(|&i| dead[i as usize])
+        .filter(|&i| !alive[i as usize])
         .collect();
 
     let max = max_freed.unwrap_or(u64::MAX);
