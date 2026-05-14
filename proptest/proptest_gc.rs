@@ -39,7 +39,7 @@ fn setup_db(
     let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("BEGIN").unwrap();
 
-    for i in 0..n {
+    for (i, &reg_time) in reg_times.iter().enumerate().take(n) {
         let hash = fake_hash(i);
         let basename = format!("{hash}-pkg-{i}");
         let full = format!("{}/{basename}", store_dir.display());
@@ -50,7 +50,7 @@ fn setup_db(
         conn.execute(
             "INSERT INTO ValidPaths (path, hash, registrationTime, narSize) \
              VALUES (?1, ?2, ?3, 100)",
-            rusqlite::params![full, format!("sha256:{hash}"), reg_times[i]],
+            rusqlite::params![full, format!("sha256:{hash}"), reg_time],
         )
         .unwrap();
     }
@@ -143,14 +143,14 @@ proptest! {
         let expected = reference_alive(n, &edges, &recent_roots);
 
         // Safety + completeness of closure
-        for i in 0..n {
+        for (i, &want) in expected.iter().enumerate().take(n) {
             let hash = fake_hash(i);
             let full = format!("{}/{hash}-pkg-{i}", store_dir.display());
             if let Some(idx) = bidx.idx_of(&full) {
                 prop_assert!(
-                    alive[idx as usize] == expected[i],
+                    alive[idx as usize] == want,
                     "mismatch for pkg-{}: got alive={}, expected={}",
-                    i, alive[idx as usize], expected[i]
+                    i, alive[idx as usize], want
                 );
             }
         }

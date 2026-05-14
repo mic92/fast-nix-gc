@@ -55,7 +55,7 @@ impl BenchStore {
 
             fs::create_dir_all(&disk).unwrap();
             // Small file so disk ops are fast
-            fs::write(disk.join("out"), &[0u8; 64]).unwrap();
+            fs::write(disk.join("out"), [0u8; 64]).unwrap();
 
             conn.execute(
                 "INSERT INTO ValidPaths (path, hash, registrationTime, narSize) VALUES (?, ?, 1000, 1024)",

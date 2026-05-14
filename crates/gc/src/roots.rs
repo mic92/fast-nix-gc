@@ -617,14 +617,11 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
         };
 
         // Owner holds a write lock while alive; if we can take it, it's stale.
-        match nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(_lock) => {
-                log::info!("removing stale temporary roots file {}", path.display());
-                fs::remove_file(&path).ok();
-                // _lock dropped here, releasing flock after unlink
-                continue;
-            }
-            Err((_, _)) => {}
+        if let Ok(_lock) = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            log::info!("removing stale temporary roots file {}", path.display());
+            fs::remove_file(&path).ok();
+            // _lock dropped here, releasing flock after unlink
+            continue;
         }
 
         let contents = match fs::read(&path) {
