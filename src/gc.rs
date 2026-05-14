@@ -29,26 +29,18 @@ fn make_store_writable(real_store_dir: &Path) -> Result<()> {
     // Preserve locked mount flags (nodev etc.) or remount fails in a userns.
     let mut flags = MsFlags::MS_REMOUNT | MsFlags::MS_BIND;
     let f = st.flags();
-    if f.contains(FsFlags::ST_NODEV) {
-        flags |= MsFlags::MS_NODEV;
-    }
-    if f.contains(FsFlags::ST_NOSUID) {
-        flags |= MsFlags::MS_NOSUID;
-    }
-    if f.contains(FsFlags::ST_NOEXEC) {
-        flags |= MsFlags::MS_NOEXEC;
-    }
-    if f.contains(FsFlags::ST_NOATIME) {
-        flags |= MsFlags::MS_NOATIME;
-    }
-    if f.contains(FsFlags::ST_NODIRATIME) {
-        flags |= MsFlags::MS_NODIRATIME;
-    }
-    if f.contains(FsFlags::ST_RELATIME) {
-        flags |= MsFlags::MS_RELATIME;
-    }
-    if f.contains(FsFlags::ST_SYNCHRONOUS) {
-        flags |= MsFlags::MS_SYNCHRONOUS;
+    for (fs_flag, ms_flag) in [
+        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
+        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+        (FsFlags::ST_SYNCHRONOUS, MsFlags::MS_SYNCHRONOUS),
+    ] {
+        if f.contains(fs_flag) {
+            flags |= ms_flag;
+        }
     }
 
     mount(
