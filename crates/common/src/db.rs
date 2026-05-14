@@ -285,6 +285,10 @@ impl StoreGraph {
         self.paths.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
     #[inline]
     pub fn refs(&self, node: u32) -> &[u32] {
         let start = self.ref_offsets[node as usize] as usize;
