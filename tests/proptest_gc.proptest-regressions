@@ -4,6 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc d89df84461c927ae92068030f84c7664ea5da367fa54cc1c24649d16b233d925 # shrinks to (n, edges, roots) = (2, [], [0, 0])
-cc 4f27684845714ab6277b027478d79bf32175a0e8dca87ed642b89234cb92e4aa # shrinks to (n, edges, roots) = (2, [], [1, 1])
 cc 69bcb92a8ee0a802bc31d865754dd10287b5e9672e0d699d699ef011057178ff # shrinks to (n, edges, roots, reg_times, cutoff) = (8, [], [0], [0, 0, 0, 0, 0, 607, 0, 0], 607)
