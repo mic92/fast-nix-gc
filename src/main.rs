@@ -163,3 +163,24 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn parse_size_units() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+        assert_eq!(parse_size("123").unwrap(), 123);
+        assert_eq!(parse_size("1K").unwrap(), 1024);
+        assert_eq!(parse_size("2k").unwrap(), 2048);
+        assert_eq!(parse_size("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("3m").unwrap(), 3 * 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1T").unwrap(), 1024u64.pow(4));
+        assert_eq!(parse_size("1.5K").unwrap(), 1536);
+        assert_eq!(parse_size(" 4M ").unwrap(), 4 * 1024 * 1024);
+        assert!(parse_size("abc").is_err());
+    }
+}
