@@ -20,14 +20,17 @@ foldhash = "0.2"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
 futures-util = "0.3"
-harmonia-nar = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
-harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
+harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-store-core = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a", default-features = false }
 
-# harmonia-nar/-hash declare their intra-workspace deps as bare version reqs;
-# patch them to the same git rev so cargo can resolve them outside that workspace.
+# harmonia crates declare intra-workspace deps as bare version reqs;
+# patch them to the same git rev so cargo can resolve them outside
+# that workspace.
 [patch.crates-io]
-harmonia-utils-io            = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
-harmonia-utils-base-encoding = { git = "https://github.com/nix-community/harmonia", rev = "6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d" }
+harmonia-file-core           = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-utils-io            = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-utils-base-encoding = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 
 [profile.release]
 

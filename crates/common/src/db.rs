@@ -1,7 +1,8 @@
 //! SQLite store database access and in-memory reference graph.
 
 use crate::HashMap;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use harmonia_store_core::store_path::{StoreDir, StorePath};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
@@ -165,6 +166,27 @@ impl NixDb {
         let mut stmt = self.conn.prepare("SELECT path FROM ValidPaths")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// `StoreDir` view of `store_dir`. Fails if it isn't valid UTF-8.
+    pub fn store_dir_typed(&self) -> Result<StoreDir> {
+        StoreDir::new(self.store_dir.clone())
+            .map_err(|e| anyhow!("{}: {e}", self.store_dir.display()))
+    }
+
+    /// Like `valid_paths` but parsed into `StorePath`. Rows that don't parse
+    /// (corrupt DB) are returned as an error rather than silently dropped.
+    pub fn valid_store_paths(&self) -> Result<Vec<StorePath>> {
+        let store_dir = self.store_dir_typed()?;
+        let mut stmt = self.conn.prepare("SELECT path FROM ValidPaths")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| {
+            let s = r?;
+            store_dir
+                .parse::<StorePath>(&s)
+                .map_err(|e| anyhow!("invalid store path '{s}': {e}"))
+        })
+        .collect()
     }
 
     /// Remove paths from the DB in a single transaction.

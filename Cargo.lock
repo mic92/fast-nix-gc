@@ -66,6 +66,9 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cc"
@@ -227,6 +230,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "foldhash 0.2.0",
+ "harmonia-store-core",
  "rusqlite",
 ]
 
@@ -264,7 +268,8 @@ dependencies = [
  "fast-nix-common",
  "foldhash 0.2.0",
  "futures-util",
- "harmonia-nar",
+ "harmonia-file-nar",
+ "harmonia-store-core",
  "harmonia-utils-hash",
  "log",
  "nix",
@@ -374,9 +379,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "harmonia-nar"
+name = "harmonia-file-core"
 version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia?rev=6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d#6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d"
+source = "git+https://github.com/nix-community/harmonia?rev=9789e1d0a322360442ff2a2a150f8bd2b9ccf93a#9789e1d0a322360442ff2a2a150f8bd2b9ccf93a"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "harmonia-file-nar"
+version = "3.1.0"
+source = "git+https://github.com/nix-community/harmonia?rev=9789e1d0a322360442ff2a2a150f8bd2b9ccf93a#9789e1d0a322360442ff2a2a150f8bd2b9ccf93a"
 dependencies = [
  "bstr",
  "bytes",
@@ -384,9 +399,12 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "harmonia-file-core",
  "harmonia-utils-io",
  "nix",
  "pin-project-lite",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -395,9 +413,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harmonia-store-core"
+version = "0.0.0-alpha.0"
+source = "git+https://github.com/nix-community/harmonia?rev=9789e1d0a322360442ff2a2a150f8bd2b9ccf93a#9789e1d0a322360442ff2a2a150f8bd2b9ccf93a"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "derive_more",
+ "harmonia-utils-base-encoding",
+ "harmonia-utils-hash",
+ "serde",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
 name = "harmonia-utils-base-encoding"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d#6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d"
+source = "git+https://github.com/nix-community/harmonia?rev=9789e1d0a322360442ff2a2a150f8bd2b9ccf93a#9789e1d0a322360442ff2a2a150f8bd2b9ccf93a"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -407,7 +440,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-hash"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d#6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d"
+source = "git+https://github.com/nix-community/harmonia?rev=9789e1d0a322360442ff2a2a150f8bd2b9ccf93a#9789e1d0a322360442ff2a2a150f8bd2b9ccf93a"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -423,7 +456,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-io"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia?rev=6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d#6dfb691c05277c0a832ba8bc9d7c12c8d6dbf52d"
+source = "git+https://github.com/nix-community/harmonia?rev=9789e1d0a322360442ff2a2a150f8bd2b9ccf93a#9789e1d0a322360442ff2a2a150f8bd2b9ccf93a"
 dependencies = [
  "bytes",
  "futures-util",

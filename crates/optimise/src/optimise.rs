@@ -3,6 +3,8 @@
 use crate::hash::nar_hash_nix32;
 use anyhow::{Context, Result, bail};
 use fast_nix_common::{HashSet, db::NixDb, format_size};
+use harmonia_store_core::store_path::StoreDir;
+use nix::fcntl::{Flock, FlockArg};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -327,7 +329,8 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
     let _gc_lock = shared_gc_lock(&opts.state_dir)?;
 
     let db = NixDb::open(&opts.store_dir, &opts.state_dir)?;
-    let paths = db.valid_paths()?;
+    let store_dir_typed: StoreDir = db.store_dir_typed()?;
+    let paths = db.valid_store_paths()?;
     drop(db);
     log::info!("optimising {} store paths", paths.len());
 
@@ -360,7 +363,7 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
                 let permit = walk_sem.clone().acquire_owned().await?;
                 let known = known.clone();
                 let tx = file_tx.clone();
-                let store_path = PathBuf::from(store_path);
+                let store_path = store_path.to_absolute_path(&store_dir_typed);
                 walks.spawn(async move {
                     let files = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
                         use walkdir::DirEntryExt as _;

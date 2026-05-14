@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use harmonia_nar::NarByteStream;
+use harmonia_file_nar::NarByteStream;
 use harmonia_utils_hash::fmt::CommonHash;
 use harmonia_utils_hash::{Algorithm, Context as HashCtx};
 use std::path::Path;
