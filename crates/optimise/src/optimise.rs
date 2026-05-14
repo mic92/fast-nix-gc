@@ -87,8 +87,8 @@ fn replace_with_link(path: &Path, link_path: &Path, store_dir: &Path) -> Result<
     };
 
     if must_toggle {
-        let st = fs::metadata(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(st.mode() | 0o200))?;
+        // Store dirs are always r-xr-xr-x; no need to read first.
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
     }
 
     let restore = scopeguard(parent, must_toggle);
@@ -167,17 +167,12 @@ fn filetime_set_zero(path: &Path) -> std::io::Result<()> {
 
 async fn optimise_file(
     path: PathBuf,
+    meta: fs::Metadata,
     links_dir: Arc<PathBuf>,
     store_dir: Arc<PathBuf>,
     opts: Arc<Options>,
     stats: Arc<Stats>,
 ) -> Result<()> {
-    let meta = match fs::symlink_metadata(&path) {
-        Ok(m) => m,
-        // Path GC'd between listing and here.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("lstat {}", path.display())),
-    };
     let ft = meta.file_type();
     // On macOS link(2) dereferences symlinks; only Linux can hardlink
     // them directly. Same gate as Nix's CAN_LINK_SYMLINK.
@@ -207,41 +202,45 @@ async fn optimise_file(
     let hash = nar_hash_nix32(&path).await?;
     let link_path = links_dir.join(&hash);
 
-    if opts.dry_run {
-        let already = fs::symlink_metadata(&link_path)
-            .map(|lm| lm.ino() == meta.ino())
-            .unwrap_or(false);
-        if !already {
-            stats.files_linked.fetch_add(1, Ordering::Relaxed);
-            stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
-        }
-        return Ok(());
-    }
-
     // symlink_metadata, not exists(): a dangling symlink in .links/
     // (corrupt state) would otherwise read as missing.
-    if fs::symlink_metadata(&link_path).is_err() {
-        match fs::hard_link(&path, &link_path) {
-            Ok(()) => {}
-            // Lost a race to another worker.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            // ext4 dir index full; just skip dedup for this file.
-            Err(e) if e.raw_os_error() == Some(libc_enospc()) => {
-                log::info!("cannot link {}: {}", link_path.display(), e);
+    let lmeta = match fs::symlink_metadata(&link_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("lstat {}", link_path.display()));
+        }
+        Err(_) => {
+            if opts.dry_run {
+                stats.files_linked.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
                 return Ok(());
             }
-            // Path GC'd between lstat and link.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("hardlink {} -> {}", path.display(), link_path.display())
-                });
+            match fs::hard_link(&path, &link_path) {
+                Ok(()) => {}
+                // Lost a race to another worker.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // ext4 dir index full; just skip dedup for this file.
+                Err(e) if e.raw_os_error() == Some(libc_enospc()) => {
+                    log::info!("cannot link {}: {}", link_path.display(), e);
+                    return Ok(());
+                }
+                // Path GC'd between lstat and link.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("hardlink {} -> {}", path.display(), link_path.display())
+                    });
+                }
             }
+            fs::symlink_metadata(&link_path)?
         }
-    }
-
-    let lmeta = fs::symlink_metadata(&link_path)?;
+    };
     if lmeta.ino() == meta.ino() {
+        return Ok(());
+    }
+    if opts.dry_run {
+        stats.files_linked.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
         return Ok(());
     }
     // Size mismatch means a corrupt .links entry; don't merge.
@@ -353,7 +352,8 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
     let work_sem = Arc::new(Semaphore::new(opts.jobs * 2));
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
-    let (file_tx, mut file_rx) = tokio::sync::mpsc::channel::<PathBuf>(opts.jobs * 16);
+    let (file_tx, mut file_rx) =
+        tokio::sync::mpsc::channel::<(PathBuf, fs::Metadata)>(opts.jobs * 16);
 
     let producer = {
         let known = known_inodes.clone();
@@ -365,33 +365,48 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
                 let tx = file_tx.clone();
                 let store_path = store_path.to_absolute_path(&store_dir_typed);
                 walks.spawn(async move {
-                    let files = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
-                        use walkdir::DirEntryExt as _;
-                        let mut out = Vec::new();
-                        for entry in WalkDir::new(&store_path).follow_links(false) {
-                            let entry = match entry {
-                                Ok(e) => e,
-                                // Path GC'd under us.
-                                Err(e)
-                                    if e.io_error().is_some_and(|ioe| {
-                                        ioe.kind() == std::io::ErrorKind::NotFound
-                                    }) =>
-                                {
+                    let files = tokio::task::spawn_blocking(
+                        move || -> Result<Vec<(PathBuf, fs::Metadata)>> {
+                            use walkdir::DirEntryExt as _;
+                            let mut out = Vec::new();
+                            for entry in WalkDir::new(&store_path).follow_links(false) {
+                                let entry = match entry {
+                                    Ok(e) => e,
+                                    // Path GC'd under us.
+                                    Err(e)
+                                        if e.io_error().is_some_and(|ioe| {
+                                            ioe.kind() == std::io::ErrorKind::NotFound
+                                        }) =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                };
+                                let ft = entry.file_type();
+                                if !ft.is_file() && !ft.is_symlink() {
                                     continue;
                                 }
-                                Err(e) => return Err(e.into()),
-                            };
-                            let ft = entry.file_type();
-                            if !ft.is_file() && !ft.is_symlink() {
-                                continue;
+                                if known.contains(&entry.ino()) {
+                                    continue;
+                                }
+                                // lstat once here; the per-file task needs
+                                // size, mode, ino. d_type alone isn't enough.
+                                let meta = match entry.metadata() {
+                                    Ok(m) => m,
+                                    Err(e)
+                                        if e.io_error().is_some_and(|ioe| {
+                                            ioe.kind() == std::io::ErrorKind::NotFound
+                                        }) =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                };
+                                out.push((entry.into_path(), meta));
                             }
-                            if known.contains(&entry.ino()) {
-                                continue;
-                            }
-                            out.push(entry.into_path());
-                        }
-                        Ok(out)
-                    })
+                            Ok(out)
+                        },
+                    )
                     .await??;
                     // Walk done; release the slot before potentially
                     // blocking on a full channel.
@@ -414,7 +429,7 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
         })
     };
 
-    while let Some(file) = file_rx.recv().await {
+    while let Some((file, meta)) = file_rx.recv().await {
         let permit = work_sem.clone().acquire_owned().await?;
         let links_dir = links_dir.clone();
         let store_dir = store_dir.clone();
@@ -422,7 +437,7 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
         let stats = stats.clone();
         tasks.spawn(async move {
             let _p = permit;
-            optimise_file(file, links_dir, store_dir, opts, stats).await
+            optimise_file(file, meta, links_dir, store_dir, opts, stats).await
         });
         while let Some(res) = tasks.try_join_next() {
             res??;
