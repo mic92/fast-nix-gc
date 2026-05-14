@@ -1,6 +1,8 @@
 # fast-nix-gc
 
-A faster `nix-collect-garbage`.
+Faster `nix-collect-garbage` and `nix-store --optimise`.
+
+## fast-nix-gc
 
 The stock GC issues one SQLite query per store path while traversing the
 reference graph. With ~100K paths this means ~100K B-tree seeks and a lot
@@ -10,25 +12,42 @@ ids. On a real store with ~30K dead paths this brings the dry-run from
 ~20s down to ~1s. Disk deletion and `.links` cleanup are parallelized
 with rayon.
 
-## Usage
-
 ```
 fast-nix-gc [OPTIONS]
 
   -d, --delete-old              Remove old profile generations
       --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d, 4h)
       --dry-run                 Show what would be done
-      --ensure-free SIZE           Free until SIZE is available (e.g. 50G)
+      --ensure-free SIZE        Free until SIZE is available (e.g. 50G)
       --keep-recent SPEC        Keep paths registered within SPEC (e.g. 1d)
       --store-dir PATH          Nix store directory [default: /nix/store]
       --state-dir PATH          Nix state directory [default: /nix/var/nix]
 ```
 
+## fast-nix-optimise
+
+Hardlink-based store dedup, on-disk compatible with `nix-store --optimise`:
+same `.links/` layout, same NAR-SHA-256 filenames, the two can be mixed
+freely. Hashing and linking run as concurrent tokio tasks; a steady-state
+store where most files are already deduped is skipped via `d_ino` from
+readdir without rehashing. ~2x faster than upstream on a warm store.
+
+```
+fast-nix-optimise [OPTIONS]
+
+      --dry-run             Show what would be done
+      --min-size BYTES      Skip files smaller than BYTES
+  -j, --jobs N              Concurrency [default: num CPUs]
+      --store-dir PATH      Nix store directory [default: /nix/store]
+      --state-dir PATH      Nix state directory [default: /nix/var/nix]
+```
+
+Both tools take a shared `gc.lock` so they don't race each other or Nix.
 `--store-dir`/`--state-dir` let you point at a separate store for testing.
 
 ## NixOS module
 
-Replace `nix.gc` with the bundled module:
+Replaces `nix.gc` and `nix.optimise`:
 
 ```nix
 {
@@ -47,6 +66,11 @@ Replace `nix.gc` with the bundled module:
             ensureFree = "50G";
             keepRecent = "1d";
           };
+          services.fast-nix-optimise = {
+            enable = true;
+            automatic = true;
+            dates = "weekly";
+          };
         }
       ];
     };
@@ -54,7 +78,7 @@ Replace `nix.gc` with the bundled module:
 }
 ```
 
-Options:
+`services.fast-nix-gc` options:
 
 | Option | Default | Description |
 |---|---|---|
@@ -67,6 +91,20 @@ Options:
 | `ensureFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
 | `keepRecent` | `null` | Pin paths registered within e.g. `"1d"` |
 | `package` | this flake's package | Override the binary |
+| `extraArgs` | `[ ]` | Extra CLI arguments |
+
+`services.fast-nix-optimise` options:
+
+| Option | Default | Description |
+|---|---|---|
+| `enable` | `false` | Enable the systemd service |
+| `automatic` | `false` | Run on a schedule via systemd timer |
+| `dates` | `"04:15"` | When to run; ordered after fast-nix-gc.service when both run |
+| `randomizedDelaySec` | `"0"` | Random delay before each run |
+| `persistent` | `true` | Run on next boot if a scheduled run was missed |
+| `minSize` | `null` | Skip files smaller than this many bytes |
+| `jobs` | `null` | Concurrency, defaults to the CPU count |
+| `package` | `services.fast-nix-gc.package` | Override the binary |
 | `extraArgs` | `[ ]` | Extra CLI arguments |
 
 Without flakes, import `nix/module.nix` directly.

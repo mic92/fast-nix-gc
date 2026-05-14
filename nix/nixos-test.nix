@@ -12,6 +12,11 @@ pkgs.testers.runNixOSTest {
         enable = true;
         keepRecent = "1h";
       };
+      services.fast-nix-optimise.enable = true;
+      # nix-store --optimise (and ours) cannot rename hardlinks across an
+      # overlayfs lower/upper boundary: ESTALE. Use a real ext4 store image
+      # instead of the default 9p+overlay setup.
+      virtualisation.useNixStoreImage = true;
       virtualisation.writableStore = true;
       environment.systemPackages = [
         pkgs.hello
@@ -41,5 +46,19 @@ pkgs.testers.runNixOSTest {
 
     # Pinned by a profile root: hello stays.
     machine.succeed("hello --version")
+
+    # Two store paths with an identical inner file; optimise should
+    # collapse them into one inode.
+    machine.succeed(
+        "mkdir /tmp/p1 /tmp/p2",
+        "echo same-content > /tmp/p1/data",
+        "echo same-content > /tmp/p2/data",
+    )
+    p1 = machine.succeed("nix-store --add /tmp/p1").strip()
+    p2 = machine.succeed("nix-store --add /tmp/p2").strip()
+    machine.succeed("systemctl start fast-nix-optimise.service")
+    out = machine.succeed(f"stat -c %i {p1}/data {p2}/data")
+    i1, i2 = out.split()
+    assert i1 == i2, f"expected shared inode after optimise, got {i1} {i2}"
   '';
 }
