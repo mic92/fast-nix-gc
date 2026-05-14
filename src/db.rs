@@ -7,19 +7,19 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// Nix store DB handle with precomputed paths.
-pub(crate) struct NixDb {
-    pub(crate) conn: Connection,
-    pub(crate) store_dir: PathBuf,
-    pub(crate) state_dir: PathBuf,
-    pub(crate) real_store_dir: PathBuf,
-    pub(crate) links_dir: PathBuf,
+pub struct NixDb {
+    pub conn: Connection,
+    pub store_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub real_store_dir: PathBuf,
+    pub links_dir: PathBuf,
     /// Mirror of Nix's `keep-derivations` setting (default: true).
     /// When set, .drv files of alive outputs are kept alive.
-    pub(crate) keep_derivations: bool,
+    pub keep_derivations: bool,
 }
 
 impl NixDb {
-    pub(crate) fn open(store_dir: &Path, state_dir: &Path) -> Result<Self> {
+    pub fn open(store_dir: &Path, state_dir: &Path) -> Result<Self> {
         let db_path = state_dir.join("db/db.sqlite");
         let conn = Connection::open_with_flags(
             &db_path,
@@ -42,7 +42,7 @@ impl NixDb {
 
     /// Read the whole reference graph in one pass. Walking it in memory is
     /// far cheaper than N point queries.
-    pub(crate) fn load_graph(&self) -> Result<StoreGraph> {
+    pub fn load_graph(&self) -> Result<StoreGraph> {
         // Both queries must see the same snapshot, otherwise a path
         // registered between them ends up with missing edges.
         self.conn.execute_batch("BEGIN")?;
@@ -141,17 +141,34 @@ impl NixDb {
 
     /// Invalidate many paths in a single transaction.
     /// Far faster than per-path auto-commit: one fsync instead of N.
-    pub(crate) fn invalidate_paths<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
-        // Self-references are handled by the DeleteSelfRefs trigger.
-        // Foreign key `on delete restrict` on Refs.reference enforces that
-        // referrers are deleted before their references; the caller passes
-        // paths in topological order so this holds.
+    pub fn invalidate_paths<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<()> {
-            let mut stmt = self.conn.prepare("DELETE FROM ValidPaths WHERE path = ?")?;
-            for p in paths {
-                stmt.execute([p])?;
+            // Collect the ids of paths to delete into a temp table so
+            // we can batch-delete their Refs in two statements instead
+            // of one subquery per path.
+            self.conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS DeadPaths (id INTEGER PRIMARY KEY)",
+            )?;
+            self.conn.execute_batch("DELETE FROM DeadPaths")?;
+            {
+                let mut ins = self.conn.prepare(
+                    "INSERT INTO DeadPaths SELECT id FROM ValidPaths WHERE path = ?",
+                )?;
+                for p in paths {
+                    ins.execute([p])?;
+                }
             }
+            // Delete reference edges involving dead paths first.
+            // Cycles among dead paths (A→B, B→A) would otherwise
+            // violate the FK `ON DELETE RESTRICT` on Refs.reference.
+            self.conn.execute_batch(
+                "DELETE FROM Refs WHERE referrer IN (SELECT id FROM DeadPaths) \
+                 OR reference IN (SELECT id FROM DeadPaths)",
+            )?;
+            self.conn.execute_batch(
+                "DELETE FROM ValidPaths WHERE id IN (SELECT id FROM DeadPaths)",
+            )?;
             Ok(())
         })();
         match result {
@@ -168,28 +185,28 @@ impl NixDb {
 }
 
 /// In-memory snapshot of the store reference graph in CSR layout.
-pub(crate) struct StoreGraph {
+pub struct StoreGraph {
     /// node idx -> store path string
-    pub(crate) paths: Vec<String>,
+    pub paths: Vec<String>,
     /// node idx -> narSize (bytes)
-    pub(crate) nar_sizes: Vec<u64>,
+    pub nar_sizes: Vec<u64>,
     /// CSR row offsets: refs of node i are ref_targets[ref_offsets[i]..ref_offsets[i+1]]
-    pub(crate) ref_offsets: Vec<u32>,
+    pub ref_offsets: Vec<u32>,
     /// CSR column indices: flat array of referenced node idxs
-    pub(crate) ref_targets: Vec<u32>,
+    pub ref_targets: Vec<u32>,
     /// store dir prefix including trailing slash, e.g. "/nix/store/"
-    pub(crate) store_prefix: String,
+    pub store_prefix: String,
 }
 
 /// Basename -> idx index for the lookups during root finding and the
 /// unknown-on-disk scan. Borrows from the StoreGraph; built once.
-pub(crate) struct BasenameIndex<'g> {
-    pub(crate) map: HashMap<&'g str, u32>,
-    pub(crate) store_prefix: &'g str,
+pub struct BasenameIndex<'g> {
+    pub map: HashMap<&'g str, u32>,
+    pub store_prefix: &'g str,
 }
 
 impl<'g> BasenameIndex<'g> {
-    pub(crate) fn new(graph: &'g StoreGraph) -> Self {
+    pub fn new(graph: &'g StoreGraph) -> Self {
         let mut map: HashMap<&'g str, u32> = HashMap::default();
         map.reserve(graph.paths.len());
         for (i, p) in graph.paths.iter().enumerate() {
@@ -203,30 +220,30 @@ impl<'g> BasenameIndex<'g> {
         }
     }
 
-    pub(crate) fn idx_of(&self, path: &str) -> Option<u32> {
+    pub fn idx_of(&self, path: &str) -> Option<u32> {
         let b = path.strip_prefix(self.store_prefix)?;
         self.map.get(b).copied()
     }
 
-    pub(crate) fn idx_of_basename(&self, basename: &str) -> Option<u32> {
+    pub fn idx_of_basename(&self, basename: &str) -> Option<u32> {
         self.map.get(basename).copied()
     }
 }
 
 impl StoreGraph {
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.paths.len()
     }
 
     #[inline]
-    pub(crate) fn refs(&self, node: u32) -> &[u32] {
+    pub fn refs(&self, node: u32) -> &[u32] {
         let start = self.ref_offsets[node as usize] as usize;
         let end = self.ref_offsets[node as usize + 1] as usize;
         &self.ref_targets[start..end]
     }
 
     /// Mark all nodes reachable from the given root indices.
-    pub(crate) fn compute_closure(&self, roots: &[u32]) -> Vec<bool> {
+    pub fn compute_closure(&self, roots: &[u32]) -> Vec<bool> {
         let mut alive = vec![false; self.len()];
         let mut stack: Vec<u32> = Vec::with_capacity(roots.len());
         for &r in roots {
@@ -248,7 +265,7 @@ impl StoreGraph {
 
     /// Topologically sort the given dead node indices so that referrers
     /// come before their references (delete leaves last).
-    pub(crate) fn topo_sort_dead(&self, dead: &[bool]) -> Vec<u32> {
+    pub fn topo_sort_dead(&self, dead: &[bool]) -> Vec<u32> {
         let n = self.len();
         let mut in_degree = vec![0u32; n];
         for i in 0..n {

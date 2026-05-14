@@ -1,15 +1,7 @@
 use anyhow::{Result, bail};
+use fast_nix_gc::{db, format_size, gc, profiles};
 use rayon::prelude::*;
 use std::path::PathBuf;
-
-mod db;
-mod gc;
-mod profiles;
-mod roots;
-
-// foldhash: SipHash showed up in profiles hashing 50-char store paths.
-pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
-pub(crate) type HashSet<K> = std::collections::HashSet<K, foldhash::fast::RandomState>;
 
 struct Args {
     delete_old: bool,
@@ -54,21 +46,6 @@ fn parse_args() -> Result<Args> {
     })
 }
 
-fn format_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let b = bytes as f64;
-    if b >= GIB {
-        format!("{:.2} GiB", b / GIB)
-    } else if b >= MIB {
-        format!("{:.2} MiB", b / MIB)
-    } else if b >= KIB {
-        format!("{:.2} KiB", b / KIB)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

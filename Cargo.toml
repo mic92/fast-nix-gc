@@ -20,6 +20,7 @@ libc = "0.2"
 tempfile = "3"
 libc = "0.2"
 rusqlite = { version = "0.39", features = ["bundled"] }
+proptest = "1"
 
 [[bench]]
 name = "gc_bench"

@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// Find all GC root node indices by walking gcroots/profiles directories
 /// and scanning running processes.
-pub(crate) fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Vec<u32> {
+pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Vec<u32> {
     let mut roots = HashSet::default();
     let store_prefix = store_dir.to_string_lossy().to_string();
 
@@ -592,7 +592,7 @@ mod runtime_roots {
 /// store paths. A file whose owning process has died is stale: we can
 /// acquire a write lock on it (the owner held one). Stale files are removed
 /// and their roots ignored, mirroring Nix's `findTempRoots`.
-pub(crate) fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
+pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
 
     let mut roots = HashSet::default();
     let temp_dir = state_dir.join("temproots");

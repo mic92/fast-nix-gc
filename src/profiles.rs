@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Parse Nix-style time specs like "30d", "4h", "2w", "1m".
-pub(crate) fn parse_older_than(spec: &str) -> Result<SystemTime> {
+pub fn parse_older_than(spec: &str) -> Result<SystemTime> {
     if spec.len() < 2 {
         bail!("invalid time spec '{}', expected e.g. '30d'", spec);
     }
@@ -121,7 +121,7 @@ fn delete_generations_older_than(profile: &Path, cutoff: SystemTime, dry_run: bo
     Ok(())
 }
 
-pub(crate) fn remove_old_generations(
+pub fn remove_old_generations(
     dir: &Path,
     delete_older_than: Option<SystemTime>,
     dry_run: bool,
@@ -162,7 +162,7 @@ pub(crate) fn remove_old_generations(
     Ok(())
 }
 
-pub(crate) fn profile_dirs(state_dir: &Path) -> BTreeSet<PathBuf> {
+pub fn profile_dirs(state_dir: &Path) -> BTreeSet<PathBuf> {
     let mut dirs = BTreeSet::new();
 
     if let Ok(user) = std::env::var("USER") {

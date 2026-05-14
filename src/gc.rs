@@ -153,7 +153,7 @@ fn acquire_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
 }
 
 /// Main GC: find roots, compute alive closure, delete dead paths.
-pub(crate) fn collect_garbage(
+pub fn collect_garbage(
     db: &NixDb,
     dry_run: bool,
     max_freed: Option<u64>,
