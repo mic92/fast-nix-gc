@@ -7,7 +7,7 @@ struct Args {
     delete_old: bool,
     delete_older_than: Option<String>,
     dry_run: bool,
-    min_free: Option<u64>,
+    ensure_free: Option<u64>,
     keep_recent: Option<String>,
     store_dir: PathBuf,
     state_dir: PathBuf,
@@ -45,7 +45,7 @@ fn parse_args() -> Result<Args> {
         eprintln!("  -d, --delete-old             Remove old profile generations");
         eprintln!("      --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d)");
         eprintln!("      --dry-run                 Show what would be done");
-        eprintln!("      --min-free SIZE           Free until SIZE is available (e.g. 50G)");
+        eprintln!("      --ensure-free SIZE           Free until SIZE is available (e.g. 50G)");
         eprintln!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
         eprintln!("      --store-dir PATH          Nix store directory [default: /nix/store]");
         eprintln!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
@@ -60,7 +60,7 @@ fn parse_args() -> Result<Args> {
         delete_old,
         delete_older_than,
         dry_run: pargs.contains("--dry-run"),
-        min_free: pargs.opt_value_from_fn("--min-free", parse_size)?,
+        ensure_free: pargs.opt_value_from_fn("--ensure-free", parse_size)?,
         keep_recent: pargs.opt_value_from_str("--keep-recent")?,
         store_dir: pargs
             .opt_value_from_str("--store-dir")?
@@ -97,11 +97,11 @@ fn main() -> Result<()> {
 
     let args = parse_args()?;
 
-    if args.min_free.is_some() && args.dry_run {
-        bail!("--min-free cannot be combined with --dry-run");
+    if args.ensure_free.is_some() && args.dry_run {
+        bail!("--ensure-free cannot be combined with --dry-run");
     }
 
-    let max_freed = if let Some(target) = args.min_free {
+    let max_freed = if let Some(target) = args.ensure_free {
         let avail = available_bytes(&args.store_dir)?;
         if avail >= target {
             println!("{} already free, nothing to do", format_size(avail));

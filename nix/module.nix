@@ -55,7 +55,7 @@ in
       description = "Delete profile generations older than this.";
     };
 
-    minFree = lib.mkOption {
+    ensureFree = lib.mkOption {
       type = lib.types.nullOr lib.types.singleLineStr;
       default = null;
       example = "50G";
@@ -102,9 +102,9 @@ in
             "--delete-older-than"
             cfg.deleteOlderThan
           ]
-          ++ lib.optionals (cfg.minFree != null) [
-            "--min-free"
-            cfg.minFree
+          ++ lib.optionals (cfg.ensureFree != null) [
+            "--ensure-free"
+            cfg.ensureFree
           ]
           ++ lib.optionals (cfg.keepRecent != null) [
             "--keep-recent"

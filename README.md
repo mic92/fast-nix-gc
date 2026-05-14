@@ -18,7 +18,7 @@ fast-nix-gc [OPTIONS]
   -d, --delete-old              Remove old profile generations
       --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d, 4h)
       --dry-run                 Show what would be done
-      --min-free SIZE           Free until SIZE is available (e.g. 50G)
+      --ensure-free SIZE           Free until SIZE is available (e.g. 50G)
       --keep-recent SPEC        Keep paths registered within SPEC (e.g. 1d)
       --store-dir PATH          Nix store directory [default: /nix/store]
       --state-dir PATH          Nix state directory [default: /nix/var/nix]
@@ -44,7 +44,7 @@ Replace `nix.gc` with the bundled module:
             automatic = true;
             dates = "weekly";
             deleteOlderThan = "30d";
-            minFree = "50G";
+            ensureFree = "50G";
             keepRecent = "1d";
           };
         }
@@ -64,7 +64,7 @@ Options:
 | `randomizedDelaySec` | `"0"` | Random delay before each run |
 | `persistent` | `true` | Run on next boot if a scheduled run was missed |
 | `deleteOlderThan` | `null` | Remove profile generations older than e.g. `"30d"` |
-| `minFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
+| `ensureFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
 | `keepRecent` | `null` | Pin paths registered within e.g. `"1d"` |
 | `package` | this flake's package | Override the binary |
 | `extraArgs` | `[ ]` | Extra CLI arguments |
