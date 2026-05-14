@@ -22,6 +22,8 @@
         }
       );
 
+      nixosModules.default = ./nix/module.nix;
+
       checks = forAllSystems (
         system:
         let
@@ -29,6 +31,9 @@
         in
         {
           proptest = pkgs.callPackage ./nix/proptest.nix { };
+        }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          nixos-test = import ./nix/nixos-test.nix { inherit pkgs; };
         }
       );
 
