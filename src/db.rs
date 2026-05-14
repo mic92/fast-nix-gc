@@ -172,9 +172,9 @@ impl NixDb {
             )?;
             self.conn.execute_batch("DELETE FROM DeadPaths")?;
             {
-                let mut ins = self.conn.prepare(
-                    "INSERT INTO DeadPaths SELECT id FROM ValidPaths WHERE path = ?",
-                )?;
+                let mut ins = self
+                    .conn
+                    .prepare("INSERT INTO DeadPaths SELECT id FROM ValidPaths WHERE path = ?")?;
                 for p in paths {
                     ins.execute([p])?;
                 }
@@ -186,9 +186,8 @@ impl NixDb {
                 "DELETE FROM Refs WHERE referrer IN (SELECT id FROM DeadPaths) \
                  OR reference IN (SELECT id FROM DeadPaths)",
             )?;
-            self.conn.execute_batch(
-                "DELETE FROM ValidPaths WHERE id IN (SELECT id FROM DeadPaths)",
-            )?;
+            self.conn
+                .execute_batch("DELETE FROM ValidPaths WHERE id IN (SELECT id FROM DeadPaths)")?;
             Ok(())
         })();
         match result {
@@ -284,5 +283,4 @@ impl StoreGraph {
         }
         alive
     }
-
 }
