@@ -27,8 +27,6 @@ name = "gc_bench"
 harness = false
 
 [profile.release]
-lto = true
-codegen-units = 1
 
 [profile.profiling]
 inherits = "release"
