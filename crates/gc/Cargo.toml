@@ -17,6 +17,7 @@ foldhash.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rusqlite.workspace = true
+harmonia-store-db.workspace = true
 
 [[bench]]
 name = "gc_bench"

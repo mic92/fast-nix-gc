@@ -23,6 +23,7 @@ futures-util = "0.3"
 harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 harmonia-store-core = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a", default-features = false }
+harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 
 # harmonia crates declare intra-workspace deps as bare version reqs;
 # patch them to the same git rev so cargo can resolve them outside
@@ -31,6 +32,7 @@ harmonia-store-core = { git = "https://github.com/nix-community/harmonia", rev =
 harmonia-file-core           = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 harmonia-utils-io            = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 harmonia-utils-base-encoding = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-store-path-info     = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 
 [profile.release]
 

@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 
-const SCHEMA: &str = include_str!("../tests/schema.sql");
+use harmonia_store_db::{OpenMode, StoreDb};
 
 struct BenchStore {
     #[allow(dead_code)]
@@ -39,10 +39,11 @@ impl BenchStore {
         fs::create_dir_all(store_dir.join(".links")).unwrap();
 
         let db_path = state_dir.join("db/db.sqlite");
+        let db = StoreDb::open(&db_path, OpenMode::Create).unwrap();
+        db.create_schema().unwrap();
+        drop(db);
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF;")
-            .unwrap();
+        conn.execute_batch("PRAGMA synchronous=OFF;").unwrap();
 
         // Batch insert paths
         conn.execute_batch("BEGIN;").unwrap();

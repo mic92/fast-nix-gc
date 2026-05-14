@@ -11,7 +11,7 @@ use fast_nix_gc::db::NixDb;
 use proptest::prelude::*;
 use rusqlite::Connection;
 
-const SCHEMA: &str = include_str!("../crates/gc/tests/schema.sql");
+use harmonia_store_db::{OpenMode, StoreDb};
 
 fn fake_hash(i: usize) -> String {
     format!("{i:032x}")
@@ -32,9 +32,11 @@ fn setup_db(
     }
     fs::create_dir_all(store_dir.join(".links")).unwrap();
 
-    let conn = Connection::open(state_dir.join("db/db.sqlite")).unwrap();
-    conn.execute_batch(SCHEMA).unwrap();
-    conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+    let db_path = state_dir.join("db/db.sqlite");
+    let db = StoreDb::open(&db_path, OpenMode::Create).unwrap();
+    db.create_schema().unwrap();
+    drop(db);
+    let conn = Connection::open(&db_path).unwrap();
     conn.execute_batch("BEGIN").unwrap();
 
     for i in 0..n {
