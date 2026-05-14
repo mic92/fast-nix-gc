@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-fast-nix-gc = { path = ".." }
+fast-nix-gc = { path = "../crates/gc" }
 proptest = "1"
 rusqlite = "0.39"
 tempfile = "3"

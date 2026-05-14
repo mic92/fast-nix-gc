@@ -11,7 +11,7 @@ use fast_nix_gc::db::NixDb;
 use proptest::prelude::*;
 use rusqlite::Connection;
 
-const SCHEMA: &str = include_str!("../tests/schema.sql");
+const SCHEMA: &str = include_str!("../crates/gc/tests/schema.sql");
 
 fn fake_hash(i: usize) -> String {
     format!("{i:032x}")

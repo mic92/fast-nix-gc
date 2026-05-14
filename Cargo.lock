@@ -123,10 +123,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fast-nix-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "foldhash 0.2.0",
+ "rusqlite",
+]
+
+[[package]]
 name = "fast-nix-gc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fast-nix-common",
  "foldhash 0.2.0",
  "log",
  "nix",
@@ -145,6 +155,20 @@ dependencies = [
  "proptest",
  "rusqlite",
  "tempfile",
+]
+
+[[package]]
+name = "fast-nix-optimise"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fast-nix-common",
+ "log",
+ "nix",
+ "pico-args",
+ "rayon",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]
