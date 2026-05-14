@@ -13,8 +13,13 @@ pub struct NixDb {
     pub real_store_dir: PathBuf,
     pub links_dir: PathBuf,
     /// Mirror of Nix's `keep-derivations` setting (default: true).
-    /// When set, .drv files of alive outputs are kept alive.
+    /// When set, .drv files of alive outputs are kept alive, and alive
+    /// .drv files keep their outputs alive.
     pub keep_derivations: bool,
+    /// Mirror of Nix's `keep-outputs` setting (default: false).
+    /// When set, outputs of alive derivations are kept alive, and alive
+    /// outputs keep their derivers alive.
+    pub keep_outputs: bool,
 }
 
 impl NixDb {
@@ -36,6 +41,7 @@ impl NixDb {
             real_store_dir: store_dir.to_path_buf(),
             links_dir: store_dir.join(".links"),
             keep_derivations: true,
+            keep_outputs: false,
         })
     }
 
@@ -92,9 +98,11 @@ impl NixDb {
             }
         }
 
-        // keep-derivations: an alive output keeps its .drv alive.
-        // Resolve via SQL join rather than building a second path→idx map.
+        // keep-derivations:
+        //   alive output → keep its .drv (via ValidPaths.deriver + DerivationOutputs)
+        //   alive .drv → keep its outputs (via DerivationOutputs)
         if self.keep_derivations {
+            // output → deriver via ValidPaths.deriver (input-addressed)
             let mut stmt = self.conn.prepare(
                 "SELECT v.id, d.id FROM ValidPaths v \
                  JOIN ValidPaths d ON d.path = v.deriver \
@@ -109,6 +117,46 @@ impl NixDb {
                 if from != MISSING && to != MISSING {
                     edges.push((from, to));
                 }
+            }
+            // output → deriver via DerivationOutputs (content-addressed)
+            let mut stmt = self.conn.prepare(
+                "SELECT o.id, do2.drv FROM ValidPaths o \
+                 JOIN DerivationOutputs do2 ON do2.path = o.path",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let out_id: i64 = row.get(0)?;
+                let drv_id: i64 = row.get(1)?;
+                let from = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
+                let to = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
+                if from != MISSING && to != MISSING {
+                    edges.push((from, to));
+                }
+            }
+            // .drv → its outputs (via DerivationOutputs)
+            self.add_drv_output_edges(&id_to_idx, &mut edges)?;
+        }
+
+        // keep-outputs: alive output → keep derivers, alive .drv → keep outputs
+        if self.keep_outputs {
+            // output → its derivers (via DerivationOutputs, reverse direction)
+            let mut stmt = self.conn.prepare(
+                "SELECT o.id, do2.drv FROM ValidPaths o \
+                 JOIN DerivationOutputs do2 ON do2.path = o.path",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let out_id: i64 = row.get(0)?;
+                let drv_id: i64 = row.get(1)?;
+                let from = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
+                let to = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
+                if from != MISSING && to != MISSING {
+                    edges.push((from, to));
+                }
+            }
+            // .drv → its outputs
+            if !self.keep_derivations {
+                self.add_drv_output_edges(&id_to_idx, &mut edges)?;
             }
         }
 
@@ -136,6 +184,26 @@ impl NixDb {
             ref_targets,
             store_prefix: format!("{}/", self.store_dir.display()),
         })
+    }
+
+    /// Add edges from each .drv to its output paths via DerivationOutputs.
+    fn add_drv_output_edges(&self, id_to_idx: &[u32], edges: &mut Vec<(u32, u32)>) -> Result<()> {
+        const MISSING: u32 = u32::MAX;
+        let mut stmt = self.conn.prepare(
+            "SELECT do2.drv, o.id FROM DerivationOutputs do2 \
+             JOIN ValidPaths o ON o.path = do2.path",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let drv_id: i64 = row.get(0)?;
+            let out_id: i64 = row.get(1)?;
+            let from = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
+            let to = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
+            if from != MISSING && to != MISSING {
+                edges.push((from, to));
+            }
+        }
+        Ok(())
     }
 
     /// Invalidate many paths in a single transaction.

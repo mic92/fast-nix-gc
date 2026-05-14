@@ -105,6 +105,15 @@ impl TestStore {
             .unwrap();
     }
 
+    fn add_drv_output(&self, drv: &Pkg, output_name: &str, out: &Pkg) {
+        self.db()
+            .execute(
+                "INSERT INTO DerivationOutputs (drv, id, path) VALUES (?, ?, ?)",
+                rusqlite::params![drv.id, output_name, out.full],
+            )
+            .unwrap();
+    }
+
     fn add_root(&self, root_name: &str, target: &Pkg) {
         let link = self.state_dir.join("gcroots").join(root_name);
         std::os::unix::fs::symlink(&target.path, &link).unwrap();
@@ -382,6 +391,46 @@ fn gc_keeps_deriver_of_alive_path() {
 
     // keep-derivations: rooted output keeps its .drv alive.
     assert!(out.path.exists() && drv.path.exists());
+    assert!(!trash.path.exists());
+}
+
+#[test]
+fn gc_keeps_ca_deriver_via_derivation_outputs() {
+    let store = TestStore::new();
+
+    // Content-addressed derivation: deriver field is NOT set on the output,
+    // but DerivationOutputs maps drv -> output path.
+    let drv = store.add_path("ca-pkg.drv", 50);
+    let out = store.add_path("ca-pkg", 200);
+    // No set_deriver — simulates CA where ValidPaths.deriver is NULL.
+    store.add_drv_output(&drv, "out", &out);
+    store.add_root("ca-out-root", &out);
+    let trash = store.add_path("trash", 100);
+
+    store.run_gc_ok(&[]);
+
+    // keep-derivations: CA output keeps its .drv alive via DerivationOutputs.
+    assert!(out.path.exists(), "output deleted");
+    assert!(drv.path.exists(), "CA deriver deleted despite alive output");
+    assert!(!trash.path.exists());
+}
+
+#[test]
+fn gc_keeps_ca_outputs_of_alive_drv() {
+    let store = TestStore::new();
+
+    // Alive .drv should keep its outputs via DerivationOutputs.
+    let drv = store.add_path("ca-pkg.drv", 50);
+    let out = store.add_path("ca-pkg", 200);
+    store.add_drv_output(&drv, "out", &out);
+    store.add_root("drv-root", &drv);
+    let trash = store.add_path("trash", 100);
+
+    store.run_gc_ok(&[]);
+
+    // keep-derivations: alive .drv keeps its outputs alive.
+    assert!(drv.path.exists(), "drv deleted");
+    assert!(out.path.exists(), "CA output deleted despite alive drv");
     assert!(!trash.path.exists());
 }
 
