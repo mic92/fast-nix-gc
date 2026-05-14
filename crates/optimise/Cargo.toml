@@ -1,0 +1,20 @@
+[package]
+name = "fast-nix-optimise"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fast-nix-optimise"
+path = "src/main.rs"
+
+[dependencies]
+fast-nix-common.workspace = true
+anyhow.workspace = true
+log.workspace = true
+pico-args.workspace = true
+rayon.workspace = true
+nix.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

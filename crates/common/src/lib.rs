@@ -1,7 +1,4 @@
 pub mod db;
-pub mod gc;
-pub mod profiles;
-pub mod roots;
 
 // foldhash: SipHash showed up in profiles hashing 50-char store paths.
 pub type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;

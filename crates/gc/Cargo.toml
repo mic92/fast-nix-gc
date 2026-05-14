@@ -1,0 +1,23 @@
+[package]
+name = "fast-nix-gc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fast-nix-common.workspace = true
+pico-args.workspace = true
+rayon.workspace = true
+walkdir.workspace = true
+anyhow.workspace = true
+nix.workspace = true
+log.workspace = true
+rusqlite.workspace = true
+foldhash.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
+
+[[bench]]
+name = "gc_bench"
+harness = false

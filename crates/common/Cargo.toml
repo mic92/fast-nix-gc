@@ -1,0 +1,9 @@
+[package]
+name = "fast-nix-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
+foldhash.workspace = true

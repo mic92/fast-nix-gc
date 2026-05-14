@@ -12,9 +12,7 @@ let
     fileset = fs.unions [
       ../Cargo.toml
       ../Cargo.lock
-      ../src
-      ../tests
-      ../benches
+      ../crates
       ../proptest
     ];
   };
@@ -32,9 +30,15 @@ rustPlatform.buildRustPackage {
   cargoBuildFlags = [
     "-p"
     "fast-nix-gc"
+    "-p"
+    "fast-nix-optimise"
   ];
   cargoTestFlags = [
     "-p"
     "fast-nix-gc"
+    "-p"
+    "fast-nix-common"
+    "-p"
+    "fast-nix-optimise"
   ];
 }
