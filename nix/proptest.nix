@@ -22,7 +22,7 @@ rustPlatform.buildRustPackage {
   pname = "fast-nix-gc-proptest";
   version = "0.1.0";
   inherit src;
-  cargoHash = "sha256-+ciVZ/eUlBOfGGZ5pvzwHxdPF4brVgKczyFt5XheQ1E=";
+  cargoLock.lockFile = ../Cargo.lock;
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ sqlite ];
   cargoTestFlags = [
