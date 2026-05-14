@@ -120,21 +120,18 @@ fn delete_store_path(real_path: &Path) -> Result<u64> {
     Ok(bytes_freed)
 }
 
-fn flock(f: &fs::File, op: i32) -> bool {
-    use std::os::fd::AsRawFd;
-    unsafe { libc::flock(f.as_raw_fd(), op) == 0 }
-}
+use nix::fcntl::{Flock, FlockArg};
 
 /// Lock a `tmp-*` build dir before deleting. None means a builder still
 /// holds it. Caller keeps the fd through deletion to avoid a TOCTOU race.
-fn try_lock_dir(path: &Path) -> Option<fs::File> {
+fn try_lock_dir(path: &Path) -> Option<Flock<fs::File>> {
     let f = fs::File::open(path).ok()?;
-    flock(&f, libc::LOCK_EX | libc::LOCK_NB).then_some(f)
+    Flock::lock(f, FlockArg::LockExclusiveNonblock).ok()
 }
 
 /// Same lock Nix takes. Builders hold it shared while registering temp
 /// roots; we take it exclusive so the root set can't change under us.
-fn acquire_gc_lock(state_dir: &Path) -> Result<fs::File> {
+fn acquire_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
     let lock_path = state_dir.join("gc.lock");
     let f = fs::OpenOptions::new()
         .read(true)
@@ -144,13 +141,15 @@ fn acquire_gc_lock(state_dir: &Path) -> Result<fs::File> {
         .open(&lock_path)
         .with_context(|| format!("opening GC lock {}", lock_path.display()))?;
 
-    if !flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
-        log::info!("waiting for the big garbage collector lock...");
-        if !flock(&f, libc::LOCK_EX) {
-            anyhow::bail!("acquiring GC lock {}", lock_path.display());
+    match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(lock),
+        Err((f, _)) => {
+            log::info!("waiting for the big garbage collector lock...");
+            Flock::lock(f, FlockArg::LockExclusive)
+                .map_err(|(_, e)| e)
+                .with_context(|| format!("acquiring GC lock {}", lock_path.display()))
         }
     }
-    Ok(f)
 }
 
 /// Main GC: find roots, compute alive closure, delete dead paths.

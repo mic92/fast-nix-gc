@@ -327,15 +327,13 @@ fn gc_skips_locked_tmp_dir() {
     fs::write(tmp.join("in-progress"), "data").unwrap();
 
     let f = fs::File::open(&tmp).unwrap();
-    assert_eq!(
-        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
+    let lock = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        .expect("flock tmp dir");
 
     store.run_gc_ok(&[]);
 
     assert!(tmp.exists(), "locked tmp dir should survive");
-    drop(f);
+    drop(lock);
 }
 
 #[test]
@@ -406,16 +404,14 @@ fn gc_drops_partial_temp_root() {
         .write(true)
         .open(&tmp_file)
         .unwrap();
-    assert_eq!(
-        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
-        0
-    );
+    let lock = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockSharedNonblock)
+        .expect("flock temp roots file");
 
     store.run_gc_ok(&[]);
 
     assert!(complete.path.exists());
     assert!(!partial.path.exists());
-    drop(f);
+    drop(lock);
 }
 
 #[test]

@@ -593,7 +593,6 @@ mod runtime_roots {
 /// acquire a write lock on it (the owner held one). Stale files are removed
 /// and their roots ignored, mirroring Nix's `findTempRoots`.
 pub(crate) fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
-    use std::os::fd::AsRawFd;
 
     let mut roots = HashSet::default();
     let temp_dir = state_dir.join("temproots");
@@ -619,11 +618,14 @@ pub(crate) fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
         };
 
         // Owner holds a write lock while alive; if we can take it, it's stale.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            log::info!("removing stale temporary roots file {}", path.display());
-            fs::remove_file(&path).ok();
-            drop(f);
-            continue;
+        match nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(_lock) => {
+                log::info!("removing stale temporary roots file {}", path.display());
+                fs::remove_file(&path).ok();
+                // _lock dropped here, releasing flock after unlink
+                continue;
+            }
+            Err((_, _)) => {}
         }
 
         let contents = match fs::read(&path) {
