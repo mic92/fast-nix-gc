@@ -305,9 +305,13 @@ fn gc_keeps_runtime_roots_from_open_fd() {
         .arg(&store.state_dir);
     unsafe {
         cmd.pre_exec(move || {
-            let flags = libc::fcntl(raw_fd, libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            use nix::fcntl::{F_GETFD, F_SETFD, FdFlag, fcntl};
+            use std::os::fd::BorrowedFd;
+            let fd = BorrowedFd::borrow_raw(raw_fd);
+            if let Ok(flags) = fcntl(fd, F_GETFD) {
+                let mut flags = FdFlag::from_bits_truncate(flags);
+                flags.remove(FdFlag::FD_CLOEXEC);
+                let _ = fcntl(fd, F_SETFD(flags));
             }
             Ok(())
         });
