@@ -22,3 +22,20 @@ pub fn format_size(bytes: u64) -> String {
         format!("{bytes} bytes")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::format_size;
+
+    #[test]
+    fn format_size_units() {
+        assert_eq!(format_size(0), "0 bytes");
+        assert_eq!(format_size(1023), "1023 bytes");
+        assert_eq!(format_size(1024), "1.00 KiB");
+        assert_eq!(format_size(1536), "1.50 KiB");
+        assert_eq!(format_size(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_size(5 * 1024 * 1024 + 512 * 1024), "5.50 MiB");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.00 GiB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024 / 2), "1.50 GiB");
+    }
+}

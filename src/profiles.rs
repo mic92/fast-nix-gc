@@ -179,3 +179,187 @@ pub fn profile_dirs(state_dir: &Path) -> BTreeSet<PathBuf> {
 
     dirs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, SystemTime};
+
+    fn approx_secs_ago(t: SystemTime, secs: u64) {
+        let elapsed = SystemTime::now().duration_since(t).unwrap();
+        let want = Duration::from_secs(secs);
+        let diff = elapsed.abs_diff(want);
+        assert!(
+            diff < Duration::from_secs(5),
+            "expected ~{secs}s ago, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_older_than_units() {
+        approx_secs_ago(parse_older_than("2h").unwrap(), 2 * 3600);
+        approx_secs_ago(parse_older_than("3d").unwrap(), 3 * 86400);
+        approx_secs_ago(parse_older_than("2w").unwrap(), 2 * 7 * 86400);
+        approx_secs_ago(parse_older_than("2m").unwrap(), 2 * 30 * 86400);
+    }
+
+    #[test]
+    fn parse_older_than_rejects_invalid() {
+        assert!(parse_older_than("").is_err());
+        assert!(parse_older_than("d").is_err());
+        assert!(parse_older_than("5x").is_err());
+        assert!(parse_older_than("xd").is_err());
+    }
+
+    #[test]
+    fn generation_links_and_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("system");
+
+        // Generation links: system-1-link, system-3-link, system-2-link, plus noise.
+        for n in [3u64, 1, 2] {
+            let link = dir.path().join(format!("system-{n}-link"));
+            symlink(format!("/nix/store/fake-{n}"), &link).unwrap();
+        }
+        symlink("/nix/store/x", dir.path().join("other-1-link")).unwrap();
+        symlink("/nix/store/x", dir.path().join("system-foo-link")).unwrap();
+
+        // Current generation -> system-2-link
+        symlink(dir.path().join("system-2-link"), &profile).unwrap();
+
+        let gens = find_generation_links(&profile).unwrap();
+        let nums: Vec<u64> = gens.iter().map(|(_, g)| *g).collect();
+        assert_eq!(nums, vec![1, 2, 3]);
+        assert_eq!(gens[0].0, dir.path().join("system-1-link"));
+
+        assert_eq!(current_generation(&profile).unwrap(), Some(2));
+    }
+
+    /// Build a temp profile dir with generations 1..=n and a `system` symlink
+    /// pointing at `system-{current}-link`. Returns the temp dir and profile path.
+    fn setup_profile(n: u64, current: u64) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 1..=n {
+            let link = dir.path().join(format!("system-{i}-link"));
+            symlink(format!("/nix/store/fake-{i}"), &link).unwrap();
+        }
+        let profile = dir.path().join("system");
+        symlink(dir.path().join(format!("system-{current}-link")), &profile).unwrap();
+        (dir, profile)
+    }
+
+    fn existing_gens(dir: &Path) -> Vec<u64> {
+        find_generation_links(&dir.join("system"))
+            .unwrap()
+            .into_iter()
+            .map(|(_, g)| g)
+            .collect()
+    }
+
+    fn set_link_mtime(path: &Path, t: SystemTime) {
+        use nix::sys::stat::{UtimensatFlags, utimensat};
+        use nix::sys::time::TimeSpec;
+        let d = t.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let ts = TimeSpec::new(d.as_secs() as i64, d.subsec_nanos() as i64);
+        utimensat(
+            nix::fcntl::AT_FDCWD,
+            path,
+            &ts,
+            &ts,
+            UtimensatFlags::NoFollowSymlink,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn delete_old_generations_keeps_only_current() {
+        let (dir, profile) = setup_profile(3, 2);
+
+        // Dry run leaves everything in place.
+        delete_old_generations(&profile, true).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3]);
+
+        delete_old_generations(&profile, false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![2]);
+    }
+
+    #[test]
+    fn delete_generations_older_than_cutoff() {
+        let (dir, profile) = setup_profile(4, 4);
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // gen i has mtime base + i*100s
+        for i in 1u64..=4 {
+            set_link_mtime(
+                &dir.path().join(format!("system-{i}-link")),
+                base + Duration::from_secs(i * 100),
+            );
+        }
+
+        // Cutoff exactly at gen 2's mtime: only gen 1 (strictly older) goes.
+        // Gen 4 is current and always kept.
+        let cutoff = base + Duration::from_secs(200);
+        delete_generations_older_than(&profile, cutoff, true).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3, 4]);
+        delete_generations_older_than(&profile, cutoff, false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![2, 3, 4]);
+
+        // Cutoff after all gens: everything but current goes.
+        delete_generations_older_than(&profile, base + Duration::from_secs(10_000), false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![4]);
+    }
+
+    #[test]
+    fn remove_old_generations_recurses_and_skips_non_link_targets() {
+        let outer = tempfile::tempdir().unwrap();
+        let nested = outer.path().join("per-user").join("alice");
+        fs::create_dir_all(&nested).unwrap();
+        for i in 1u64..=3 {
+            symlink(
+                format!("/nix/store/fake-{i}"),
+                nested.join(format!("prof-{i}-link")),
+            )
+            .unwrap();
+        }
+        symlink(nested.join("prof-3-link"), nested.join("prof")).unwrap();
+        // Symlink whose target does not contain "link": must be left alone.
+        symlink("/nix/store/zzz", outer.path().join("plain")).unwrap();
+
+        remove_old_generations(outer.path(), None, false).unwrap();
+
+        let gens: Vec<u64> = find_generation_links(&nested.join("prof"))
+            .unwrap()
+            .into_iter()
+            .map(|(_, g)| g)
+            .collect();
+        assert_eq!(gens, vec![3]);
+        assert!(outer.path().join("plain").symlink_metadata().is_ok());
+    }
+
+    #[test]
+    fn profile_dirs_includes_state_and_user_paths() {
+        let state = Path::new("/var/state");
+        let dirs = profile_dirs(state);
+        assert!(dirs.contains(&state.join("profiles")));
+        if let Ok(user) = std::env::var("USER") {
+            assert!(dirs.contains(&state.join("profiles/per-user").join(user)));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(dirs.contains(&PathBuf::from(home)));
+        }
+    }
+
+    #[test]
+    fn current_generation_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(current_generation(&dir.path().join("nope")).unwrap(), None);
+
+        // Profile exists but doesn't point at a -link target.
+        let profile = dir.path().join("system");
+        symlink("/nix/store/whatever", &profile).unwrap();
+        assert_eq!(current_generation(&profile).unwrap(), None);
+
+        // No matching generation links anywhere.
+        assert_eq!(find_generation_links(&profile).unwrap(), vec![]);
+    }
+}
