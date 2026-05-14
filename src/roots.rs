@@ -304,7 +304,7 @@ mod runtime_roots {
     const KERN_PROCARGS2: c_int = 49;
     const KERN_ARGMAX: c_int = 8;
 
-    extern "C" {
+    unsafe extern "C" {
         fn proc_listpids(
             type_: u32,
             typeinfo: u32,

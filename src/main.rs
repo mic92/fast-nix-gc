@@ -31,7 +31,8 @@ fn parse_size(s: &str) -> Result<u64> {
 fn available_bytes(path: &Path) -> Result<u64> {
     let st =
         nix::sys::statvfs::statvfs(path).with_context(|| format!("statvfs {}", path.display()))?;
-    Ok(st.blocks_available() * st.fragment_size())
+    // statvfs field types differ between Linux (u64) and macOS (u32).
+    Ok(st.blocks_available() as u64 * st.fragment_size() as u64)
 }
 
 fn parse_args() -> Result<Args> {

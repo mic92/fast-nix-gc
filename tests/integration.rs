@@ -289,6 +289,9 @@ fn gc_keep_recent_pins_recently_registered() {
     );
 }
 
+// libproc on macOS can't inspect other processes inside the nix
+// sandbox; we can only test this via /proc on Linux.
+#[cfg(target_os = "linux")]
 #[test]
 fn gc_keeps_runtime_roots_from_open_fd() {
     use std::os::unix::process::CommandExt;
