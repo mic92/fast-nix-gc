@@ -41,27 +41,48 @@ impl Default for Options {
 }
 
 /// Inodes already in `.links/`. Files with these inodes are already deduped
-/// and can be skipped without hashing.
+/// and can be skipped without hashing. Uses d_ino from readdir; with 1M+
+/// link entries a stat per entry would dominate startup.
 fn load_link_inodes(links_dir: &Path) -> Result<HashSet<u64>> {
+    use nix::dir::Dir;
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+
     let mut set = HashSet::default();
-    match fs::read_dir(links_dir) {
-        Ok(rd) => {
-            for entry in rd {
-                let entry = entry?;
-                set.insert(entry.metadata()?.ino());
-            }
+    let mut dir = match Dir::open(
+        links_dir,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+        Mode::empty(),
+    ) {
+        Ok(d) => d,
+        Err(nix::errno::Errno::ENOENT) => return Ok(set),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", links_dir.display())),
+    };
+    for entry in dir.iter() {
+        let entry = entry.with_context(|| format!("reading {}", links_dir.display()))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {}", links_dir.display())),
+        set.insert(entry.ino());
     }
     Ok(set)
 }
 
-/// Replace `path` with a hardlink to `link_path`, preserving the
-/// store-invariant that parent directories are read-only and have mtime 0.
+/// Replace `path` with a hardlink to `link_path`. Store dirs are read-only
+/// with mtime 1; toggle writable around the rename and restore afterwards.
+///
+/// Holds a per-directory lock so concurrent tasks linking siblings don't
+/// observe the dir flip back to read-only mid-operation.
 fn replace_with_link(path: &Path, link_path: &Path, store_dir: &Path) -> Result<()> {
     let parent = path.parent().context("file has no parent")?;
     let must_toggle = parent != store_dir;
+
+    let _dir_lock = if must_toggle {
+        Some(dir_mutex(parent).lock().unwrap())
+    } else {
+        None
+    };
 
     if must_toggle {
         let st = fs::metadata(parent)?;
@@ -115,6 +136,18 @@ impl Drop for ParentRestore<'_> {
 }
 fn scopeguard(dir: &Path, active: bool) -> ParentRestore<'_> {
     ParentRestore { dir, active }
+}
+
+/// Sharded mutex pool keyed by parent directory. Bounds memory while
+/// keeping contention low for typical fan-out.
+fn dir_mutex(dir: &Path) -> &'static std::sync::Mutex<()> {
+    use std::hash::BuildHasher;
+    use std::sync::OnceLock;
+    const SHARDS: usize = 256;
+    static POOL: OnceLock<Vec<std::sync::Mutex<()>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| (0..SHARDS).map(|_| std::sync::Mutex::new(())).collect());
+    let h = foldhash::fast::FixedState::default().hash_one(dir);
+    &pool[h as usize % SHARDS]
 }
 
 fn filetime_set_zero(path: &Path) -> std::io::Result<()> {
@@ -298,68 +331,102 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
     drop(db);
     log::info!("optimising {} store paths", paths.len());
 
-    let known_inodes = Arc::new(load_link_inodes(&links_dir)?);
-    log::debug!("loaded {} known link inodes", known_inodes.len());
+    let t0 = std::time::Instant::now();
+    let ld = links_dir.clone();
+    let known_inodes = Arc::new(tokio::task::spawn_blocking(move || load_link_inodes(&ld)).await??);
+    log::info!(
+        "loaded {} known link inodes in {:.1?}",
+        known_inodes.len(),
+        t0.elapsed()
+    );
 
     let opts = Arc::new(opts);
     let links_dir = Arc::new(links_dir);
     let store_dir = Arc::new(opts.store_dir.clone());
     let stats = Arc::new(Stats::default());
-    let sem = Arc::new(Semaphore::new(opts.jobs));
+    // Two independent pools. Sharing one would deadlock: walk tasks hold
+    // permits while blocked on the bounded channel, starving consumers.
+    let walk_sem = Arc::new(Semaphore::new(opts.jobs));
+    let work_sem = Arc::new(Semaphore::new(opts.jobs * 2));
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
-    for store_path in paths {
-        // walkdir is sync; run on the blocking pool, then spawn one task
-        // per file. Files are independent until the link/rename step.
+    let (file_tx, mut file_rx) = tokio::sync::mpsc::channel::<PathBuf>(opts.jobs * 16);
+
+    let producer = {
         let known = known_inodes.clone();
-        let store_path = PathBuf::from(store_path);
-        let entries = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
-            let mut out = Vec::new();
-            for entry in WalkDir::new(&store_path).follow_links(false) {
-                let entry = match entry {
-                    Ok(e) => e,
-                    // Path can vanish under us (concurrent GC).
-                    Err(e)
-                        if e.io_error()
-                            .is_some_and(|ioe| ioe.kind() == std::io::ErrorKind::NotFound) =>
-                    {
-                        continue;
+        tokio::spawn(async move {
+            let mut walks: JoinSet<Result<()>> = JoinSet::new();
+            for store_path in paths {
+                let permit = walk_sem.clone().acquire_owned().await?;
+                let known = known.clone();
+                let tx = file_tx.clone();
+                let store_path = PathBuf::from(store_path);
+                walks.spawn(async move {
+                    let files = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
+                        use walkdir::DirEntryExt as _;
+                        let mut out = Vec::new();
+                        for entry in WalkDir::new(&store_path).follow_links(false) {
+                            let entry = match entry {
+                                Ok(e) => e,
+                                // Path GC'd under us.
+                                Err(e)
+                                    if e.io_error().is_some_and(|ioe| {
+                                        ioe.kind() == std::io::ErrorKind::NotFound
+                                    }) =>
+                                {
+                                    continue;
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
+                            let ft = entry.file_type();
+                            if !ft.is_file() && !ft.is_symlink() {
+                                continue;
+                            }
+                            if known.contains(&entry.ino()) {
+                                continue;
+                            }
+                            out.push(entry.into_path());
+                        }
+                        Ok(out)
+                    })
+                    .await??;
+                    // Walk done; release the slot before potentially
+                    // blocking on a full channel.
+                    drop(permit);
+                    for f in files {
+                        if tx.send(f).await.is_err() {
+                            break;
+                        }
                     }
-                    Err(e) => return Err(e.into()),
-                };
-                let ft = entry.file_type();
-                if !ft.is_file() && !ft.is_symlink() {
-                    continue;
+                    Ok(())
+                });
+                while let Some(res) = walks.try_join_next() {
+                    res??;
                 }
-                if let Ok(m) = entry.metadata()
-                    && known.contains(&m.ino())
-                {
-                    continue;
-                }
-                out.push(entry.into_path());
             }
-            Ok(out)
+            while let Some(res) = walks.join_next().await {
+                res??;
+            }
+            anyhow::Ok(())
         })
-        .await??;
+    };
 
-        for file in entries {
-            let permit = sem.clone().acquire_owned().await?;
-            let links_dir = links_dir.clone();
-            let store_dir = store_dir.clone();
-            let opts = opts.clone();
-            let stats = stats.clone();
-            tasks.spawn(async move {
-                let _p = permit;
-                optimise_file(file, links_dir, store_dir, opts, stats).await
-            });
-        }
-
-        // Drain finished tasks to bound memory.
+    while let Some(file) = file_rx.recv().await {
+        let permit = work_sem.clone().acquire_owned().await?;
+        let links_dir = links_dir.clone();
+        let store_dir = store_dir.clone();
+        let opts = opts.clone();
+        let stats = stats.clone();
+        tasks.spawn(async move {
+            let _p = permit;
+            optimise_file(file, links_dir, store_dir, opts, stats).await
+        });
         while let Some(res) = tasks.try_join_next() {
             res??;
         }
     }
 
+    producer.await??;
     while let Some(res) = tasks.join_next().await {
         res??;
     }
