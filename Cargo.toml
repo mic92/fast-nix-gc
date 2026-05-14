@@ -12,8 +12,7 @@ rayon = "1"
 walkdir = "2"
 anyhow = "1"
 nix = { version = "0.31", features = ["fs", "user", "dir", "mount"] }
-log = "0.4"
-env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
+log = { version = "0.4", features = ["std"] }
 rusqlite = "0.39"
 foldhash = "0.2"
 libc = "0.2"
