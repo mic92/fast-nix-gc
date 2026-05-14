@@ -41,10 +41,10 @@ or `nix develop -c cargo build --release`.
 Roots are gathered from `gcroots/`, `profiles/`, `temproots/`, and running
 processes (`/proc` on Linux; `libproc` syscalls on macOS instead of
 shelling out to `lsof`). Stale temp-root files and dangling auto-roots are
-removed. `keep-derivations` is honored (`.drv` of an alive output stays
-alive). The store is remounted read-write on NixOS where it's bind-mounted
-read-only. `tmp-*` build dirs are skipped if a builder still holds the
-lock.
+removed. `keep-derivations` and `keep-outputs` are honored, including for
+content-addressed derivations (via the `DerivationOutputs` table). The
+store is remounted read-write on NixOS where it's bind-mounted read-only.
+`tmp-*` build dirs are skipped if a builder still holds the lock.
 
 The GC takes the same `gc.lock` Nix does, so it won't race with
 `nix-build` or another GC. If interrupted mid-run the DB stays
@@ -53,6 +53,7 @@ unknown entries by the next GC.
 
 ## Not implemented
 
-- `keep-outputs` (off by default in Nix). Would need reverse deriver edges.
 - GC roots socket. Builders block on the GC lock instead of registering
   new roots while the GC runs.
+- Reading `keep-derivations`/`keep-outputs` from `nix.conf` (defaults are
+  used: `keep-derivations=true`, `keep-outputs=false`).
