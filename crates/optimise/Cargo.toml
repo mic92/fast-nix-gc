@@ -24,3 +24,7 @@ harmonia-store-core.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rusqlite.workspace = true
+
+[[bench]]
+name = "optimise_bench"
+harness = false
