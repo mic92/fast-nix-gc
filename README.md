@@ -18,7 +18,7 @@ fast-nix-gc [OPTIONS]
   -d, --delete-old              Remove old profile generations
       --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d, 4h)
       --dry-run                 Show what would be done
-      --max-freed BYTES         Maximum bytes to free
+      --min-free SIZE           Free until SIZE is available (e.g. 50G)
       --store-dir PATH          Nix store directory [default: /nix/store]
       --state-dir PATH          Nix state directory [default: /nix/var/nix]
 ```

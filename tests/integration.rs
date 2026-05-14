@@ -235,14 +235,15 @@ fn gc_removes_unknown_disk_entries() {
 
 #[test]
 fn gc_max_freed_stops_early() {
+    use fast_nix_gc::{db::NixDb, gc::collect_garbage};
     let store = TestStore::new();
     store.add_path("dead1", 100);
     store.add_path("dead2", 100);
 
-    let out = store.run_gc_ok(&["--max-freed", "1"]);
+    let nix_db = NixDb::open(&store.store_dir, &store.state_dir).unwrap();
+    let (_, deleted) = collect_garbage(&nix_db, false, Some(1)).unwrap();
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("1 store paths deleted"), "stdout: {stdout}");
+    assert_eq!(deleted, 1, "should stop after one path");
 }
 
 #[test]
