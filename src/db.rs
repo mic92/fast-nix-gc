@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
-/// Nix store DB handle with precomputed paths.
+/// Handle to the Nix store SQLite database.
 pub struct NixDb {
     pub conn: Connection,
     pub store_dir: PathBuf,
@@ -45,8 +45,8 @@ impl NixDb {
         })
     }
 
-    /// Read the whole reference graph in one pass. Walking it in memory is
-    /// far cheaper than N point queries.
+    /// Load the full reference graph into memory. Walking it as an
+    /// in-memory CSR is far cheaper than N point queries.
     pub fn load_graph(&self) -> Result<StoreGraph> {
         // Both queries must see the same snapshot, otherwise a path
         // registered between them ends up with missing edges.
@@ -156,8 +156,7 @@ impl NixDb {
         })
     }
 
-    /// Invalidate many paths in a single transaction.
-    /// Far faster than per-path auto-commit: one fsync instead of N.
+    /// Remove paths from the DB in a single transaction.
     pub fn invalidate_paths<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<()> {
