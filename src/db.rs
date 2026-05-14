@@ -57,25 +57,21 @@ impl NixDb {
 
         let mut paths: Vec<String> = Vec::new();
         let mut nar_sizes: Vec<u64> = Vec::new();
-        // Deriver of each path (if any), for keep-derivations.
-        let mut derivers: Vec<Option<String>> = Vec::new();
         {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id, path, narSize, deriver FROM ValidPaths")?;
+                .prepare("SELECT id, path, narSize FROM ValidPaths")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let id: i64 = row.get(0)?;
                 let path: String = row.get(1)?;
                 let nar: Option<i64> = row.get(2)?;
-                let deriver: Option<String> = row.get(3)?;
                 let idx = paths.len() as u32;
                 if (id as usize) < id_to_idx.len() {
                     id_to_idx[id as usize] = idx;
                 }
                 paths.push(path);
                 nar_sizes.push(nar.unwrap_or(0).max(0) as u64);
-                derivers.push(deriver);
             }
         }
 
@@ -96,23 +92,27 @@ impl NixDb {
             }
         }
 
-        self.conn.execute_batch("COMMIT")?;
-
         // keep-derivations: an alive output keeps its .drv alive.
+        // Resolve via SQL join rather than building a second path→idx map.
         if self.keep_derivations {
-            let mut path_idx: HashMap<&str, u32> = HashMap::default();
-            path_idx.reserve(n);
-            for (i, p) in paths.iter().enumerate() {
-                path_idx.insert(p.as_str(), i as u32);
-            }
-            for (i, d) in derivers.iter().enumerate() {
-                if let Some(d) = d
-                    && let Some(&drv_idx) = path_idx.get(d.as_str())
-                {
-                    edges.push((i as u32, drv_idx));
+            let mut stmt = self.conn.prepare(
+                "SELECT v.id, d.id FROM ValidPaths v \
+                 JOIN ValidPaths d ON d.path = v.deriver \
+                 WHERE v.deriver IS NOT NULL",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let out_id: i64 = row.get(0)?;
+                let drv_id: i64 = row.get(1)?;
+                let from = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
+                let to = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
+                if from != MISSING && to != MISSING {
+                    edges.push((from, to));
                 }
             }
         }
+
+        self.conn.execute_batch("COMMIT")?;
 
         let mut ref_offsets = vec![0u32; n + 1];
         for &(from, _) in &edges {
