@@ -84,6 +84,11 @@ in
       }
     ];
 
+    warnings = lib.optional (cfg.automatic && config.nix.gc.automatic) ''
+      Both services.fast-nix-gc.automatic and nix.gc.automatic are enabled.
+      Disable nix.gc.automatic to avoid running two garbage collectors.
+    '';
+
     systemd.services.fast-nix-gc = {
       description = "Fast Nix Garbage Collector";
       serviceConfig = {
