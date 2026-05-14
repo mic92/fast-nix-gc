@@ -17,7 +17,11 @@ fn fake_hash(i: usize) -> String {
     format!("{i:032x}")
 }
 
-fn setup_db(n: usize, edges: &[(usize, usize)]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+fn setup_db(
+    n: usize,
+    edges: &[(usize, usize)],
+    reg_times: &[i64],
+) -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("store");
     let state_dir = dir.path().join("state");
@@ -43,8 +47,8 @@ fn setup_db(n: usize, edges: &[(usize, usize)]) -> (tempfile::TempDir, PathBuf, 
 
         conn.execute(
             "INSERT INTO ValidPaths (path, hash, registrationTime, narSize) \
-             VALUES (?1, ?2, 1000, 100)",
-            rusqlite::params![full, format!("sha256:{hash}")],
+             VALUES (?1, ?2, ?3, 100)",
+            rusqlite::params![full, format!("sha256:{hash}"), reg_times[i]],
         )
         .unwrap();
     }
@@ -86,11 +90,15 @@ fn reference_alive(n: usize, edges: &[(usize, usize)], roots: &[usize]) -> Vec<b
     alive
 }
 
-fn graph_strategy() -> impl Strategy<Value = (usize, Vec<(usize, usize)>, Vec<usize>)> {
+type GraphInput = (usize, Vec<(usize, usize)>, Vec<usize>, Vec<i64>, i64);
+
+fn graph_strategy() -> impl Strategy<Value = GraphInput> {
     (2usize..50).prop_flat_map(|n| {
         let edges = prop::collection::vec((0..n, 0..n), 0..n * 2);
         let roots = prop::collection::vec(0..n, 1..=n.min(10));
-        (Just(n), edges, roots)
+        let reg_times = prop::collection::vec(0i64..1000, n);
+        let cutoff = 0i64..1000;
+        (Just(n), edges, roots, reg_times, cutoff)
     })
 }
 
@@ -101,25 +109,36 @@ proptest! {
     /// alive/dead sets, and invalidate_paths handles cycles.
     #[test]
     fn graph_closure_matches_reference(
-        (n, edges, roots) in graph_strategy()
+        (n, edges, roots, reg_times, cutoff) in graph_strategy()
     ) {
-        let (_dir, store_dir, state_dir) = setup_db(n, &edges);
+        let (_dir, store_dir, state_dir) = setup_db(n, &edges, &reg_times);
         let db = NixDb::open(&store_dir, &state_dir).unwrap();
         let graph = db.load_graph().unwrap();
 
         let bidx = fast_nix_gc::db::BasenameIndex::new(&graph);
 
-        // Map root node indices
+        // Map root node indices, plus paths registered at/after the cutoff
+        // (mirroring --keep-recent).
         let root_indices: Vec<u32> = roots.iter()
             .filter_map(|&r| {
                 let hash = fake_hash(r);
                 let basename = format!("{hash}-pkg-{r}");
                 bidx.idx_of_basename(&basename)
             })
+            .chain(
+                graph.registration_times.iter().enumerate()
+                    .filter(|&(_, &t)| t >= cutoff)
+                    .map(|(i, _)| i as u32)
+            )
             .collect();
 
         let alive = graph.compute_closure(&root_indices);
-        let expected = reference_alive(n, &edges, &roots);
+
+        // Reference model: roots + recently registered nodes.
+        let recent_roots: Vec<usize> = roots.iter().copied()
+            .chain((0..n).filter(|&i| reg_times[i] >= cutoff))
+            .collect();
+        let expected = reference_alive(n, &edges, &recent_roots);
 
         // Safety + completeness of closure
         for i in 0..n {
