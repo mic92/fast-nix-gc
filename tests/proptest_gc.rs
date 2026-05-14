@@ -134,16 +134,16 @@ proptest! {
             }
         }
 
-        // Topo sort + invalidate: must not violate FK constraints
-        let dead: Vec<bool> = alive.iter().map(|&a| !a).collect();
-        let sorted = graph.topo_sort_dead(&dead);
+        // Invalidation must not violate FK constraints (cycles etc.)
+        let dead_paths: Vec<String> = (0..n)
+            .filter(|&i| !expected[i])
+            .map(|i| {
+                let hash = fake_hash(i);
+                format!("{}/{hash}-pkg-{i}", store_dir.display())
+            })
+            .collect();
 
-        // Every dead node appears exactly once
-        let dead_count = dead.iter().filter(|&&d| d).count();
-        prop_assert_eq!(sorted.len(), dead_count);
-
-        // Invalidation succeeds (FK violations would error)
-        db.invalidate_paths(sorted.iter().map(|&n| graph.paths[n as usize].as_str())).unwrap();
+        db.invalidate_paths(dead_paths.iter().map(|s| s.as_str())).unwrap();
 
         // Verify DB state
         let remaining: Vec<String> = {

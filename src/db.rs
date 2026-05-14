@@ -3,7 +3,6 @@
 use crate::HashMap;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 /// Nix store DB handle with precomputed paths.
@@ -263,48 +262,4 @@ impl StoreGraph {
         alive
     }
 
-    /// Topologically sort the given dead node indices so that referrers
-    /// come before their references (delete leaves last).
-    pub fn topo_sort_dead(&self, dead: &[bool]) -> Vec<u32> {
-        let n = self.len();
-        let mut in_degree = vec![0u32; n];
-        for i in 0..n {
-            if !dead[i] {
-                continue;
-            }
-            for &r in self.refs(i as u32) {
-                if dead[r as usize] && r as usize != i {
-                    in_degree[r as usize] += 1;
-                }
-            }
-        }
-
-        let mut queue: VecDeque<u32> = (0..n as u32)
-            .filter(|&i| dead[i as usize] && in_degree[i as usize] == 0)
-            .collect();
-        let mut sorted = Vec::with_capacity(dead.iter().filter(|&&d| d).count());
-        let mut emitted = vec![false; n];
-
-        while let Some(node) = queue.pop_front() {
-            sorted.push(node);
-            emitted[node as usize] = true;
-            for &r in self.refs(node) {
-                if dead[r as usize] && r as usize != node as usize {
-                    in_degree[r as usize] -= 1;
-                    if in_degree[r as usize] == 0 {
-                        queue.push_back(r);
-                    }
-                }
-            }
-        }
-
-        // Append any remaining dead nodes (cycles).
-        for i in 0..n as u32 {
-            if dead[i as usize] && !emitted[i as usize] {
-                sorted.push(i);
-            }
-        }
-
-        sorted
-    }
 }

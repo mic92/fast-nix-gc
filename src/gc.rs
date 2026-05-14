@@ -215,9 +215,9 @@ pub fn collect_garbage(
         log::info!("{} unknown paths on disk not in DB", unknown_on_disk.len());
     }
 
-    // Sort dead paths topologically (referrers before references).
-    log::info!("topologically sorting dead paths...");
-    let sorted_dead = graph.topo_sort_dead(&dead);
+    let dead_indices: Vec<u32> = (0..graph.len() as u32)
+        .filter(|&i| dead[i as usize])
+        .collect();
 
     let max = max_freed.unwrap_or(u64::MAX);
 
@@ -226,7 +226,7 @@ pub fn collect_garbage(
         let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
         let mut estimated = 0u64;
         let mut count = 0usize;
-        for &node in &sorted_dead {
+        for &node in &dead_indices {
             if estimated >= max {
                 break;
             }
@@ -255,10 +255,10 @@ pub fn collect_garbage(
     let chunk_size = if max_freed.is_some() {
         1
     } else {
-        sorted_dead.len().max(1)
+        dead_indices.len().max(1)
     };
 
-    'outer: for chunk in sorted_dead.chunks(chunk_size) {
+    'outer: for chunk in dead_indices.chunks(chunk_size) {
         if bytes_freed.load(Ordering::Relaxed) >= max {
             log::info!("deleted more than {max} bytes; stopping");
             break 'outer;
