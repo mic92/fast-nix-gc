@@ -26,11 +26,57 @@ fast-nix-gc [OPTIONS]
 
 `--store-dir`/`--state-dir` let you point at a separate store for testing.
 
+## NixOS module
+
+Replace `nix.gc` with the bundled module:
+
+```nix
+{
+  inputs.fast-nix-gc.url = "github:Mic92/fast-nix-gc";
+
+  outputs = { nixpkgs, fast-nix-gc, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        fast-nix-gc.nixosModules.default
+        {
+          services.fast-nix-gc = {
+            enable = true;
+            automatic = true;
+            dates = "weekly";
+            deleteOlderThan = "30d";
+            minFree = "50G";
+            keepRecent = "7d";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Options:
+
+| Option | Default | Description |
+|---|---|---|
+| `enable` | `false` | Enable the systemd service |
+| `automatic` | `false` | Run on a schedule via systemd timer |
+| `dates` | `"03:15"` | When to run (`systemd.time(7)` calendar event) |
+| `randomizedDelaySec` | `"0"` | Random delay before each run |
+| `persistent` | `true` | Run on next boot if a scheduled run was missed |
+| `deleteOlderThan` | `null` | Remove profile generations older than e.g. `"30d"` |
+| `minFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
+| `keepRecent` | `null` | Pin paths registered within e.g. `"7d"` |
+| `package` | this flake's package | Override the binary |
+| `extraArgs` | `[ ]` | Extra CLI arguments |
+
+Without flakes, import `nix/module.nix` directly.
+
 ## Building
 
     nix build
 
-or `nix develop -c cargo build --release`.
+or `nix develop -c cargo build --release`. Without flakes:
+`nix-build` (uses `default.nix`).
 
 ## Testing
 
