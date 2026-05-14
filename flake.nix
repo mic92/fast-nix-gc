@@ -1,8 +1,12 @@
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.treefmt-nix = {
+    url = "github:numtide/treefmt-nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, treefmt-nix, ... }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "x86_64-linux"
@@ -22,6 +26,14 @@
         }
       );
 
+      formatter = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        (import ./nix/treefmt.nix { inherit pkgs treefmt-nix; }).config.build.wrapper
+      );
+
       nixosModules.default = ./nix/module.nix;
 
       checks = forAllSystems (
@@ -31,6 +43,9 @@
         in
         {
           proptest = pkgs.callPackage ./nix/proptest.nix { };
+        }
+        // {
+          treefmt = (import ./nix/treefmt.nix { inherit pkgs treefmt-nix; }).config.build.check ./.;
         }
         // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-test = import ./nix/nixos-test.nix { inherit pkgs; };

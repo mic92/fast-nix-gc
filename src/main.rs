@@ -29,8 +29,8 @@ fn parse_size(s: &str) -> Result<u64> {
 
 /// Free bytes on the filesystem containing `path`.
 fn available_bytes(path: &Path) -> Result<u64> {
-    let st = nix::sys::statvfs::statvfs(path)
-        .with_context(|| format!("statvfs {}", path.display()))?;
+    let st =
+        nix::sys::statvfs::statvfs(path).with_context(|| format!("statvfs {}", path.display()))?;
     Ok(st.blocks_available() * st.fragment_size())
 }
 
@@ -69,7 +69,6 @@ fn parse_args() -> Result<Args> {
             .unwrap_or_else(|| PathBuf::from("/nix/var/nix")),
     })
 }
-
 
 /// Minimal stderr logger: `[LEVEL] message`. Level controlled by
 /// RUST_LOG=error|warn|info|debug|trace (default: info).

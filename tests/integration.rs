@@ -283,7 +283,10 @@ fn gc_keep_recent_pins_recently_registered() {
     collect_garbage(&nix_db, &opts).unwrap();
 
     assert!(!old.path.exists(), "old path should be GC'd");
-    assert!(recent.path.exists(), "recent path should survive --keep-recent");
+    assert!(
+        recent.path.exists(),
+        "recent path should survive --keep-recent"
+    );
 }
 
 #[test]

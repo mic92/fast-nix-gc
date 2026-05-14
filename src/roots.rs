@@ -593,7 +593,6 @@ mod runtime_roots {
 /// acquire a write lock on it (the owner held one). Stale files are removed
 /// and their roots ignored, mirroring Nix's `findTempRoots`.
 pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
-
     let mut roots = HashSet::default();
     let temp_dir = state_dir.join("temproots");
 
