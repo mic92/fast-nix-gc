@@ -1,41 +1,45 @@
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
-  outputs = { nixpkgs, ... }:
+  outputs =
+    { nixpkgs, ... }:
     let
-      forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
+      forAllSystems = nixpkgs.lib.genAttrs [
+        "x86_64-linux"
+        "aarch64-linux"
+        "aarch64-darwin"
+        "x86_64-darwin"
+      ];
     in
     {
-      packages = forAllSystems (system:
+      packages = forAllSystems (
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage {
-            pname = "fast-nix-gc";
-            version = "0.1.0";
-            src = ./.;
-            cargoHash = "sha256-CmS7qn+tl/363RhgchZcm94qahCVPOT3fluhp+AyTNI=";
-            nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs = [ pkgs.nix ];
-          };
-        });
+          default = pkgs.callPackage ./nix/package.nix { };
+        }
+      );
 
-      devShells = forAllSystems (system:
+      checks = forAllSystems (
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = pkgs.mkShell {
-            packages = [
-              pkgs.cargo
-              pkgs.rustc
-              pkgs.clippy
-              pkgs.rustfmt
-              pkgs.pkg-config
-              pkgs.nix
-            ];
-          };
-        });
+          proptest = pkgs.callPackage ./nix/proptest.nix { };
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.callPackage ./nix/shell.nix { };
+        }
+      );
     };
 }
