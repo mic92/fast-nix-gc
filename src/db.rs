@@ -84,80 +84,50 @@ impl NixDb {
         // CSR adjacency: flat target array + per-node offsets.
         let n = paths.len();
         let mut edges: Vec<(u32, u32)> = Vec::new();
-        {
-            let mut stmt = self.conn.prepare("SELECT referrer, reference FROM Refs")?;
+
+        let mut add_edges = |conn: &Connection, sql: &str| -> Result<()> {
+            let mut stmt = conn.prepare(sql)?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
-                let referrer: i64 = row.get(0)?;
-                let reference: i64 = row.get(1)?;
-                let from = *id_to_idx.get(referrer as usize).unwrap_or(&MISSING);
-                let to = *id_to_idx.get(reference as usize).unwrap_or(&MISSING);
+                let from_id: i64 = row.get(0)?;
+                let to_id: i64 = row.get(1)?;
+                let from = *id_to_idx.get(from_id as usize).unwrap_or(&MISSING);
+                let to = *id_to_idx.get(to_id as usize).unwrap_or(&MISSING);
                 if from != MISSING && to != MISSING {
                     edges.push((from, to));
                 }
             }
-        }
+            Ok(())
+        };
 
-        // keep-derivations:
-        //   alive output → keep its .drv (via ValidPaths.deriver + DerivationOutputs)
-        //   alive .drv → keep its outputs (via DerivationOutputs)
+        // Refs table: direct references between store paths.
+        add_edges(&self.conn, "SELECT referrer, reference FROM Refs")?;
+
+        // output → deriver via ValidPaths.deriver (input-addressed)
         if self.keep_derivations {
-            // output → deriver via ValidPaths.deriver (input-addressed)
-            let mut stmt = self.conn.prepare(
+            add_edges(
+                &self.conn,
                 "SELECT v.id, d.id FROM ValidPaths v \
                  JOIN ValidPaths d ON d.path = v.deriver \
                  WHERE v.deriver IS NOT NULL",
             )?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let out_id: i64 = row.get(0)?;
-                let drv_id: i64 = row.get(1)?;
-                let from = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
-                let to = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
-                if from != MISSING && to != MISSING {
-                    edges.push((from, to));
-                }
-            }
-            // output → deriver via DerivationOutputs (content-addressed)
-            let mut stmt = self.conn.prepare(
-                "SELECT o.id, do2.drv FROM ValidPaths o \
-                 JOIN DerivationOutputs do2 ON do2.path = o.path",
-            )?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let out_id: i64 = row.get(0)?;
-                let drv_id: i64 = row.get(1)?;
-                let from = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
-                let to = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
-                if from != MISSING && to != MISSING {
-                    edges.push((from, to));
-                }
-            }
-            // .drv → its outputs (via DerivationOutputs)
-            self.add_drv_output_edges(&id_to_idx, &mut edges)?;
         }
 
-        // keep-outputs: alive output → keep derivers, alive .drv → keep outputs
-        if self.keep_outputs {
-            // output → its derivers (via DerivationOutputs, reverse direction)
-            let mut stmt = self.conn.prepare(
+        // output ↔ drv via DerivationOutputs (content-addressed).
+        // keep-derivations: output→drv and drv→output.
+        // keep-outputs: output→drv and drv→output.
+        // Both need the same two edge sets, so add each at most once.
+        if self.keep_derivations || self.keep_outputs {
+            add_edges(
+                &self.conn,
                 "SELECT o.id, do2.drv FROM ValidPaths o \
                  JOIN DerivationOutputs do2 ON do2.path = o.path",
             )?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let out_id: i64 = row.get(0)?;
-                let drv_id: i64 = row.get(1)?;
-                let from = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
-                let to = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
-                if from != MISSING && to != MISSING {
-                    edges.push((from, to));
-                }
-            }
-            // .drv → its outputs
-            if !self.keep_derivations {
-                self.add_drv_output_edges(&id_to_idx, &mut edges)?;
-            }
+            add_edges(
+                &self.conn,
+                "SELECT do2.drv, o.id FROM DerivationOutputs do2 \
+                 JOIN ValidPaths o ON o.path = do2.path",
+            )?;
         }
 
         self.conn.execute_batch("COMMIT")?;
@@ -184,26 +154,6 @@ impl NixDb {
             ref_targets,
             store_prefix: format!("{}/", self.store_dir.display()),
         })
-    }
-
-    /// Add edges from each .drv to its output paths via DerivationOutputs.
-    fn add_drv_output_edges(&self, id_to_idx: &[u32], edges: &mut Vec<(u32, u32)>) -> Result<()> {
-        const MISSING: u32 = u32::MAX;
-        let mut stmt = self.conn.prepare(
-            "SELECT do2.drv, o.id FROM DerivationOutputs do2 \
-             JOIN ValidPaths o ON o.path = do2.path",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let drv_id: i64 = row.get(0)?;
-            let out_id: i64 = row.get(1)?;
-            let from = *id_to_idx.get(drv_id as usize).unwrap_or(&MISSING);
-            let to = *id_to_idx.get(out_id as usize).unwrap_or(&MISSING);
-            if from != MISSING && to != MISSING {
-                edges.push((from, to));
-            }
-        }
-        Ok(())
     }
 
     /// Invalidate many paths in a single transaction.
