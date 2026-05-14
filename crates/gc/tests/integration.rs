@@ -5,7 +5,7 @@ use std::process::Command;
 
 use rusqlite::Connection;
 
-const SCHEMA: &str = include_str!("schema.sql");
+use harmonia_store_db::{OpenMode, StoreDb};
 
 struct TestStore {
     #[allow(dead_code)] // keep tempdir alive
@@ -50,9 +50,8 @@ impl TestStore {
         }
         fs::create_dir_all(store_dir.join(".links")).unwrap();
 
-        let conn = Connection::open(state_dir.join("db/db.sqlite")).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        let db = StoreDb::open(state_dir.join("db/db.sqlite"), OpenMode::Create).unwrap();
+        db.create_schema().unwrap();
 
         TestStore {
             dir,

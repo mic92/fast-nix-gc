@@ -11,9 +11,7 @@ let
     fileset = fs.unions [
       ../Cargo.toml
       ../Cargo.lock
-      ../src
-      ../tests
-      ../benches
+      ../crates
       ../proptest
     ];
   };
