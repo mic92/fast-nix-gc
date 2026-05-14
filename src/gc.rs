@@ -314,8 +314,9 @@ fn clean_links(links_dir: &Path) -> Result<()> {
         Err(_) => return Ok(()),
     };
 
-    let actual_size = AtomicI64::new(0);
-    let unshared_size = AtomicI64::new(0);
+    // For each surviving link with N references, hard linking saves
+    // (N-1)*size bytes compared to N independent copies.
+    let saved_bytes = AtomicI64::new(0);
 
     entries.par_iter().for_each(|entry| {
         let path = entry.path();
@@ -323,8 +324,7 @@ fn clean_links(links_dir: &Path) -> Result<()> {
             return;
         };
         if meta.nlink() != 1 {
-            actual_size.fetch_add(meta.size() as i64, Ordering::Relaxed);
-            unshared_size.fetch_add(
+            saved_bytes.fetch_add(
                 (meta.nlink() as i64 - 1) * meta.size() as i64,
                 Ordering::Relaxed,
             );
@@ -333,11 +333,7 @@ fn clean_links(links_dir: &Path) -> Result<()> {
         fs::remove_file(&path).ok();
     });
 
-    let overhead = fs::metadata(links_dir)
-        .map(|m| m.blocks() as i64 * 512)
-        .unwrap_or(0);
-
-    let saving = unshared_size.into_inner() - actual_size.into_inner() - overhead;
+    let saving = saved_bytes.into_inner();
     if saving > 0 {
         log::info!(
             "hard linking is currently saving {}",
