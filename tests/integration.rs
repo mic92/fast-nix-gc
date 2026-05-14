@@ -464,6 +464,40 @@ fn gc_drops_partial_temp_root() {
 }
 
 #[test]
+fn gc_keeps_temp_root_not_yet_in_db() {
+    let store = TestStore::new();
+
+    // Simulate a builder that wrote a temp root and materialized the
+    // store path on disk, but hasn't registered it in ValidPaths yet.
+    let hash = fake_hash("in-progress");
+    let basename = format!("{hash}-in-progress");
+    let path = store.store_dir.join(&basename);
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("file"), "building").unwrap();
+
+    let tmp_file = store.state_dir.join("temproots/12345");
+    let mut data = format!("{}/{basename}", store.store_dir.display()).into_bytes();
+    data.push(0);
+    fs::write(&tmp_file, &data).unwrap();
+
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&tmp_file)
+        .unwrap();
+    let lock = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockSharedNonblock)
+        .expect("flock temp roots file");
+
+    store.run_gc_ok(&[]);
+
+    assert!(
+        path.exists(),
+        "path with temp root deleted as unknown-on-disk"
+    );
+    drop(lock);
+}
+
+#[test]
 fn gc_removes_stale_temp_roots_file() {
     let store = TestStore::new();
 

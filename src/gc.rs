@@ -168,10 +168,17 @@ pub fn collect_garbage(
     log::info!("finding garbage collector roots...");
     let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx);
 
-    // Add temp roots
+    // Add temp roots. Some may reference paths registered after our
+    // graph snapshot (a builder can register paths while we hold
+    // gc.lock as long as it wrote its temp root before we acquired it).
+    // Track those by basename so the unknown-on-disk scan won't
+    // delete them.
+    let mut temp_root_basenames: crate::HashSet<String> = crate::HashSet::default();
     for tr in find_temp_roots(&db.state_dir)? {
         if let Some(i) = bidx.idx_of(&tr) {
             roots.push(i);
+        } else if let Some(b) = tr.strip_prefix(graph.store_prefix.as_str()) {
+            temp_root_basenames.insert(b.to_owned());
         }
     }
     roots.sort_unstable();
@@ -196,7 +203,9 @@ pub fn collect_garbage(
             if name == "." || name == ".." || name == ".links" {
                 continue;
             }
-            if bidx.idx_of_basename(name.as_ref()).is_none() {
+            if bidx.idx_of_basename(name.as_ref()).is_none()
+                && !temp_root_basenames.contains(name.as_ref())
+            {
                 unknown_on_disk.push(name.into_owned());
             }
         }
