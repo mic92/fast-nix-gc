@@ -43,6 +43,10 @@ impl NixDb {
     /// Read the whole reference graph in one pass. Walking it in memory is
     /// far cheaper than N point queries.
     pub(crate) fn load_graph(&self) -> Result<StoreGraph> {
+        // Both queries must see the same snapshot, otherwise a path
+        // registered between them ends up with missing edges.
+        self.conn.execute_batch("BEGIN")?;
+
         // ids are dense autoincrement, so a Vec works as the id->idx map.
         let max_id: i64 =
             self.conn
@@ -92,6 +96,8 @@ impl NixDb {
                 }
             }
         }
+
+        self.conn.execute_batch("COMMIT")?;
 
         // keep-derivations: an alive output keeps its .drv alive.
         if self.keep_derivations {
