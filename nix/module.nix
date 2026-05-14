@@ -6,6 +6,7 @@
 }:
 let
   cfg = config.services.fast-nix-gc;
+  ocfg = config.services.fast-nix-optimise;
 in
 {
   options.services.fast-nix-gc = {
@@ -79,49 +80,155 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.automatic -> config.nix.enable;
-        message = "services.fast-nix-gc.automatic requires nix.enable";
-      }
-    ];
+  options.services.fast-nix-optimise = {
+    enable = lib.mkEnableOption "fast-nix-optimise, a faster nix-store --optimise";
 
-    warnings = lib.optional (cfg.automatic && config.nix.gc.automatic) ''
-      Both services.fast-nix-gc.automatic and nix.gc.automatic are enabled.
-      Disable nix.gc.automatic to avoid running two garbage collectors.
-    '';
-
-    systemd.services.fast-nix-gc = {
-      description = "Fast Nix Garbage Collector";
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = lib.escapeShellArgs (
-          [ "${cfg.package}/bin/fast-nix-gc" ]
-          ++ lib.optionals (cfg.deleteOlderThan != null) [
-            "--delete-older-than"
-            cfg.deleteOlderThan
-          ]
-          ++ lib.optionals (cfg.ensureFree != null) [
-            "--ensure-free"
-            cfg.ensureFree
-          ]
-          ++ lib.optionals (cfg.keepRecent != null) [
-            "--keep-recent"
-            cfg.keepRecent
-          ]
-          ++ cfg.extraArgs
-        );
-      };
-      startAt = lib.optionals cfg.automatic cfg.dates;
-      restartIfChanged = false;
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = cfg.package;
+      defaultText = lib.literalExpression "config.services.fast-nix-gc.package";
+      description = "Package providing the fast-nix-optimise binary.";
     };
 
-    systemd.timers.fast-nix-gc = lib.mkIf cfg.automatic {
-      timerConfig = {
-        RandomizedDelaySec = cfg.randomizedDelaySec;
-        Persistent = cfg.persistent;
-      };
+    automatic = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Run store deduplication automatically on a schedule.";
+    };
+
+    dates = lib.mkOption {
+      type = with lib.types; either singleLineStr (listOf str);
+      apply = lib.toList;
+      default = [ "04:15" ];
+      example = "weekly";
+      description = ''
+        When to run. Calendar event in the format specified by
+        {manpage}`systemd.time(7)`.
+      '';
+    };
+
+    randomizedDelaySec = lib.mkOption {
+      type = lib.types.singleLineStr;
+      default = "0";
+      example = "45min";
+      description = "Randomized delay before each run.";
+    };
+
+    persistent = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Run on next boot if a scheduled run was missed.";
+    };
+
+    minSize = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      example = 4096;
+      description = "Skip files smaller than this many bytes.";
+    };
+
+    jobs = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      description = "Concurrency. Defaults to the number of CPUs.";
+    };
+
+    extraArgs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = "Extra arguments to pass to fast-nix-optimise.";
     };
   };
+
+  config = lib.mkMerge [
+    (lib.mkIf cfg.enable {
+      assertions = [
+        {
+          assertion = cfg.automatic -> config.nix.enable;
+          message = "services.fast-nix-gc.automatic requires nix.enable";
+        }
+      ];
+
+      warnings = lib.optional (cfg.automatic && config.nix.gc.automatic) ''
+        Both services.fast-nix-gc.automatic and nix.gc.automatic are enabled.
+        Disable nix.gc.automatic to avoid running two garbage collectors.
+      '';
+
+      systemd.services.fast-nix-gc = {
+        description = "Fast Nix Garbage Collector";
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = lib.escapeShellArgs (
+            [ "${cfg.package}/bin/fast-nix-gc" ]
+            ++ lib.optionals (cfg.deleteOlderThan != null) [
+              "--delete-older-than"
+              cfg.deleteOlderThan
+            ]
+            ++ lib.optionals (cfg.ensureFree != null) [
+              "--ensure-free"
+              cfg.ensureFree
+            ]
+            ++ lib.optionals (cfg.keepRecent != null) [
+              "--keep-recent"
+              cfg.keepRecent
+            ]
+            ++ cfg.extraArgs
+          );
+        };
+        startAt = lib.optionals cfg.automatic cfg.dates;
+        restartIfChanged = false;
+      };
+
+      systemd.timers.fast-nix-gc = lib.mkIf cfg.automatic {
+        timerConfig = {
+          RandomizedDelaySec = cfg.randomizedDelaySec;
+          Persistent = cfg.persistent;
+        };
+      };
+    })
+
+    (lib.mkIf ocfg.enable {
+      assertions = [
+        {
+          assertion = ocfg.automatic -> config.nix.enable;
+          message = "services.fast-nix-optimise.automatic requires nix.enable";
+        }
+      ];
+
+      warnings = lib.optional (ocfg.automatic && config.nix.optimise.automatic) ''
+        Both services.fast-nix-optimise.automatic and nix.optimise.automatic are
+        enabled. Disable nix.optimise.automatic to avoid running both.
+      '';
+
+      systemd.services.fast-nix-optimise = {
+        description = "Fast Nix Store Optimiser";
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = lib.escapeShellArgs (
+            [ "${ocfg.package}/bin/fast-nix-optimise" ]
+            ++ lib.optionals (ocfg.minSize != null) [
+              "--min-size"
+              (toString ocfg.minSize)
+            ]
+            ++ lib.optionals (ocfg.jobs != null) [
+              "--jobs"
+              (toString ocfg.jobs)
+            ]
+            ++ ocfg.extraArgs
+          );
+        };
+        startAt = lib.optionals ocfg.automatic ocfg.dates;
+        restartIfChanged = false;
+        # Avoid racing the GC.
+        after = lib.optional cfg.enable "fast-nix-gc.service";
+      };
+
+      systemd.timers.fast-nix-optimise = lib.mkIf ocfg.automatic {
+        timerConfig = {
+          RandomizedDelaySec = ocfg.randomizedDelaySec;
+          Persistent = ocfg.persistent;
+        };
+      };
+    })
+  ];
 }
