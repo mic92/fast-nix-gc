@@ -17,8 +17,9 @@ walkdir.workspace = true
 foldhash.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
-harmonia-nar.workspace = true
+harmonia-file-nar.workspace = true
 harmonia-utils-hash.workspace = true
+harmonia-store-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -7,3 +7,4 @@ edition.workspace = true
 anyhow.workspace = true
 rusqlite.workspace = true
 foldhash.workspace = true
+harmonia-store-core.workspace = true

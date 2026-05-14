@@ -24,7 +24,7 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../Cargo.lock;
     outputHashes = {
-      "harmonia-nar-3.1.0" = "sha256-PIwK3nLlkNLf5pC+PWzwE34bTf4t/7uTrw0GjPDeU7M=";
+      "harmonia-file-nar-3.1.0" = "sha256-YklzRujFo5lvFsdLoedE6OL6OvSwNk/nfwlGxulyTS4=";
     };
   };
   nativeBuildInputs = [ pkg-config ];
