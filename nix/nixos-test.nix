@@ -14,10 +14,13 @@ pkgs.testers.runNixOSTest {
       };
       services.fast-nix-optimise.enable = true;
       # nix-store --optimise (and ours) cannot rename hardlinks across an
-      # overlayfs lower/upper boundary: ESTALE. Use a real ext4 store image
-      # instead of the default 9p+overlay setup.
+      # overlayfs lower/upper boundary: ESTALE on the 9p host store. A
+      # store image avoids that, but the overlay upper is still tmpfs and
+      # .links/ hardlinks the entire system closure into it; give the VM
+      # enough RAM for that.
       virtualisation.useNixStoreImage = true;
       virtualisation.writableStore = true;
+      virtualisation.memorySize = 2048;
       environment.systemPackages = [
         pkgs.hello
         pkgs.sqlite
