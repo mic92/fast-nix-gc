@@ -621,8 +621,8 @@ pub(crate) fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
         // Owner holds a write lock while alive; if we can take it, it's stale.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             log::info!("removing stale temporary roots file {}", path.display());
-            drop(f);
             fs::remove_file(&path).ok();
+            drop(f);
             continue;
         }
 
