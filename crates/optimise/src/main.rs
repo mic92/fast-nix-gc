@@ -1,6 +1,8 @@
 use anyhow::Result;
 
+mod hash;
+mod optimise;
+
 fn main() -> Result<()> {
-    eprintln!("fast-nix-optimise: not yet implemented");
-    std::process::exit(1);
+    optimise::cli_main()
 }

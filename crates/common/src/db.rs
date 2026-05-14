@@ -160,6 +160,13 @@ impl NixDb {
         })
     }
 
+    /// Return all valid store paths (full paths, e.g. `/nix/store/xxx-foo`).
+    pub fn valid_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM ValidPaths")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Remove paths from the DB in a single transaction.
     pub fn invalidate_paths<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
