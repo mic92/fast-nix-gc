@@ -1,12 +1,11 @@
 //! Profile generation cleanup (--delete-old / --delete-older-than).
 
 use anyhow::{Context, Result, bail};
-use chrono::{Duration, Local};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Parse Nix-style time specs like "30d", "4h", "2w", "1m".
 pub fn parse_older_than(spec: &str) -> Result<SystemTime> {
@@ -15,15 +14,15 @@ pub fn parse_older_than(spec: &str) -> Result<SystemTime> {
     }
     // split_at must land on a char boundary; suffix is always ASCII.
     let (num_str, unit) = spec.split_at(spec.len() - 1);
-    let num: i64 = num_str.parse().context("invalid number in time spec")?;
-    let dur = match unit {
-        "h" => Duration::hours(num),
-        "d" => Duration::days(num),
-        "w" => Duration::weeks(num),
-        "m" => Duration::days(num * 30),
+    let num: u64 = num_str.parse().context("invalid number in time spec")?;
+    let secs = match unit {
+        "h" => num * 3600,
+        "d" => num * 86400,
+        "w" => num * 7 * 86400,
+        "m" => num * 30 * 86400,
         _ => bail!("unknown time unit '{}', use h/d/w/m", unit),
     };
-    Ok(SystemTime::from(Local::now() - dur))
+    Ok(SystemTime::now() - Duration::from_secs(secs))
 }
 
 fn find_generation_links(profile: &Path) -> Result<Vec<(PathBuf, u64)>> {
