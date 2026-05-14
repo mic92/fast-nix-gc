@@ -104,3 +104,10 @@ unknown entries by the next GC.
   new roots while the GC runs.
 - Reading `keep-derivations`/`keep-outputs` from `nix.conf` (defaults are
   used: `keep-derivations=true`, `keep-outputs=false`).
+
+## FAQ
+
+**Could this have been implemented in upstream Nix?**
+
+Yes, but C++ and concurrency is a scary combination,
+which is why I went with this implementation first.
