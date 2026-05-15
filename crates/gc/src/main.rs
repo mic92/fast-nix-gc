@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use fast_nix_common::unshare_mount_namespace;
 use fast_nix_gc::{db, format_size, gc, profiles};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,11 @@ fn main() -> Result<()> {
     log::set_max_level(level);
 
     let args = parse_args()?;
+
+    // Before rayon spawns its global pool; see docs.
+    if !args.dry_run {
+        unshare_mount_namespace();
+    }
 
     if args.ensure_free.is_some() && args.dry_run {
         bail!("--ensure-free cannot be combined with --dry-run");

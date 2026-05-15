@@ -1,64 +1,14 @@
 //! Garbage collection: liveness computation and store path deletion.
 
 use crate::db::{BasenameIndex, NixDb};
-use crate::format_size;
 use crate::roots::{find_roots, find_temp_roots};
+use crate::{format_size, make_store_writable};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// NixOS bind-mounts /nix/store read-only; remount rw before deleting.
-#[cfg(target_os = "linux")]
-fn make_store_writable(real_store_dir: &Path) -> Result<()> {
-    use nix::mount::{MsFlags, mount};
-    use nix::sys::statvfs::{FsFlags, statvfs};
-    use nix::unistd::Uid;
-
-    if !Uid::effective().is_root() {
-        return Ok(());
-    }
-
-    let st = statvfs(real_store_dir).context("getting Nix store mount info")?;
-    if !st.flags().contains(FsFlags::ST_RDONLY) {
-        return Ok(());
-    }
-
-    // Preserve locked mount flags (nodev etc.) or remount fails in a userns.
-    let mut flags = MsFlags::MS_REMOUNT | MsFlags::MS_BIND;
-    let f = st.flags();
-    for (fs_flag, ms_flag) in [
-        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
-        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
-        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
-        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
-        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
-        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
-        (FsFlags::ST_SYNCHRONOUS, MsFlags::MS_SYNCHRONOUS),
-    ] {
-        if f.contains(fs_flag) {
-            flags |= ms_flag;
-        }
-    }
-
-    mount(
-        None::<&str>,
-        real_store_dir,
-        None::<&str>,
-        flags,
-        None::<&str>,
-    )
-    .with_context(|| format!("remounting {} writable", real_store_dir.display()))?;
-    log::info!("remounted {} read-write", real_store_dir.display());
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn make_store_writable(_real_store_dir: &Path) -> Result<()> {
-    Ok(())
-}
 
 /// Delete a store path from disk, returning bytes freed.
 /// Store paths are read-only (chmod a-w on registration); make directories

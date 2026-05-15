@@ -1,5 +1,98 @@
 pub mod db;
 
+use anyhow::{Context, Result};
+use std::path::Path;
+
+/// Enter a private mount namespace so the rw remount in
+/// `make_store_writable` is scoped to this process and does not leak into
+/// the system, mirroring what the `nix` CLI does for root.
+///
+/// Must be called from `main` before any thread pool is spawned:
+/// `unshare(CLONE_NEWNS)` only moves the calling thread into the new
+/// namespace, so worker threads created earlier would stay in the host
+/// namespace and not see the remount.
+///
+/// Failures are logged and ignored (e.g. EPERM in containers); we then
+/// fall back to remounting in the host namespace, like legacy `nix-store`.
+#[cfg(target_os = "linux")]
+pub fn unshare_mount_namespace() {
+    use nix::mount::{MsFlags, mount};
+    use nix::sched::{CloneFlags, unshare};
+    use nix::unistd::Uid;
+
+    if !Uid::effective().is_root() {
+        return;
+    }
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWNS) {
+        log::warn!("failed to set up a private mount namespace: {e}");
+        return;
+    }
+    // Default propagation on systemd is `shared`; without this a remount
+    // would propagate back to the host namespace.
+    if let Err(e) = mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        None::<&str>,
+    ) {
+        log::warn!("failed to mark / private in mount namespace: {e}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unshare_mount_namespace() {}
+
+/// NixOS bind-mounts /nix/store read-only; remount rw before mutating.
+#[cfg(target_os = "linux")]
+pub fn make_store_writable(real_store_dir: &Path) -> Result<()> {
+    use nix::mount::{MsFlags, mount};
+    use nix::sys::statvfs::{FsFlags, statvfs};
+    use nix::unistd::Uid;
+
+    if !Uid::effective().is_root() {
+        return Ok(());
+    }
+
+    let st = statvfs(real_store_dir).context("getting Nix store mount info")?;
+    if !st.flags().contains(FsFlags::ST_RDONLY) {
+        return Ok(());
+    }
+
+    // Preserve locked mount flags (nodev etc.) or remount fails in a userns.
+    let mut flags = MsFlags::MS_REMOUNT | MsFlags::MS_BIND;
+    let f = st.flags();
+    for (fs_flag, ms_flag) in [
+        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
+        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+        (FsFlags::ST_SYNCHRONOUS, MsFlags::MS_SYNCHRONOUS),
+    ] {
+        if f.contains(fs_flag) {
+            flags |= ms_flag;
+        }
+    }
+
+    mount(
+        None::<&str>,
+        real_store_dir,
+        None::<&str>,
+        flags,
+        None::<&str>,
+    )
+    .with_context(|| format!("remounting {} writable", real_store_dir.display()))?;
+    log::info!("remounted {} read-write", real_store_dir.display());
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn make_store_writable(_real_store_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 // foldhash: SipHash showed up in profiles hashing 50-char store paths.
 pub type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
 pub type HashSet<K> = std::collections::HashSet<K, foldhash::fast::RandomState>;

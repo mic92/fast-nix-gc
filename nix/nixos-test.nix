@@ -59,6 +59,8 @@ pkgs.testers.runNixOSTest {
     )
     p1 = machine.succeed("nix-store --add /tmp/p1").strip()
     p2 = machine.succeed("nix-store --add /tmp/p2").strip()
+    # Force a read-only store so optimise must remount rw (issue #7).
+    machine.succeed("mount -o remount,ro,bind /nix/store")
     machine.succeed("systemctl start fast-nix-optimise.service")
     out = machine.succeed(f"stat -c %i {p1}/data {p2}/data")
     i1, i2 = out.split()
