@@ -150,7 +150,7 @@ which is why I went with this implementation first.
 
 ## Real-world timings
 
-Not a scientific benchmark — just `journalctl` data from a few of my
+This is not a scientific benchmark, just `journalctl` data from a few of my
 machines after switching the daily GC timer from `nix-gc.service` to
 `fast-nix-gc.service`. Workloads differ between runs, sample sizes are
 small, and hardware varies. Take it as a rough indication of scale, not a
