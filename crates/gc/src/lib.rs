@@ -1,4 +1,5 @@
 pub mod gc;
+pub mod gc_socket;
 pub mod profiles;
 pub mod roots;
 
