@@ -43,6 +43,9 @@ fast-nix-optimise [OPTIONS]
 ```
 
 Both tools take a shared `gc.lock` so they don't race each other or Nix.
+While fast-nix-gc deletes, it serves the GC roots socket
+(`state/gc-socket/socket`, same protocol as `nix-store --gc`), so concurrent
+`nix build`s register temp roots without blocking on the lock.
 `--store-dir`/`--state-dir` let you point at a separate store for testing.
 
 ## NixOS module
@@ -138,8 +141,6 @@ unknown entries by the next GC.
 
 ## Not implemented
 
-- GC roots socket. Builders block on the GC lock instead of registering
-  new roots while the GC runs.
 - Reading `keep-derivations`/`keep-outputs` from `nix.conf` (defaults are
   used: `keep-derivations=true`, `keep-outputs=false`).
 

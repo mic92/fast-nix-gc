@@ -1,6 +1,7 @@
 //! Garbage collection: liveness computation and store path deletion.
 
 use crate::db::{BasenameIndex, NixDb};
+use crate::gc_socket::{GcSocketServer, LiveSet};
 use crate::roots::{find_roots, find_temp_roots};
 use crate::{format_size, make_store_writable};
 use anyhow::{Context, Result};
@@ -8,6 +9,7 @@ use rayon::prelude::*;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Delete a store path from disk, returning bytes freed.
@@ -116,8 +118,21 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     }
 
     log::info!("loading store graph...");
-    let graph = db.load_graph()?;
+    let graph = Arc::new(db.load_graph()?);
     log::info!("{} total valid paths", graph.len());
+
+    // Start the gc-socket as soon as the graph is loaded so builders stop
+    // busy-polling gc.lock. Roots received only shrink the dead set.
+    let live = Arc::new(LiveSet::new(graph.len(), crate::HashSet::default()));
+    let _gc_socket = if dry_run {
+        None
+    } else {
+        Some(GcSocketServer::start(
+            &db.state_dir,
+            Arc::clone(&live),
+            Arc::clone(&graph),
+        )?)
+    };
 
     let bidx = BasenameIndex::new(&graph);
 
@@ -209,11 +224,18 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
 
     log::info!("deleting garbage...");
 
+    // Test sync point: block until the named fifo is readable. The NixOS
+    // test connects to gc-socket here so the protect() path is exercised
+    // deterministically rather than racing the delete loop.
+    if let Ok(p) = std::env::var("_FAST_NIX_GC_TEST_SYNC") {
+        let _ = fs::read(&p);
+    }
+
     // Bulk-invalidate, then delete from disk in parallel. Safe to crash
     // mid-delete: leftover dirs are picked up as unknown-on-disk next run.
     let real_store_dir = db.real_store_dir.clone();
     let bytes_freed = AtomicU64::new(0);
-    let mut paths_deleted = 0usize;
+    let paths_deleted = AtomicU64::new(0);
 
     // Fill each chunk by cumulative narSize up to the remaining --ensure-free
     // budget, then re-check actual freed bytes (narSize over-reports for
@@ -234,31 +256,52 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         }
         let chunk = &dead_indices[cursor..end];
         cursor = end;
-
-        db.invalidate_paths(chunk.iter().map(|&n| graph.paths[n as usize].as_str()))?;
-        chunk.par_iter().for_each(|&node| {
-            let path = &graph.paths[node as usize];
-            let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
-            let real_path = real_store_dir.join(basename);
-            log::debug!("deleting '{path}'");
-            if let Ok(freed) = delete_store_path(&real_path) {
-                bytes_freed.fetch_add(freed, Ordering::Relaxed);
-            }
-        });
-        paths_deleted += chunk.len();
+        // Snapshot-filter, don't pre-claim: protect() should wait for the
+        // rayon-bounded in-flight set, not the whole chunk.
+        let claimed: Vec<u32> = chunk
+            .iter()
+            .copied()
+            .filter(|&n| !live.is_protected(n))
+            .collect();
+        // Disk first, DB second: paths protected between filter and unlink
+        // keep their DB entry. Crash mid-delete still self-heals via the
+        // unknown-on-disk scan next run.
+        let deleted: Vec<u32> = claimed
+            .par_iter()
+            .copied()
+            .filter(|&node| {
+                if !live.try_begin_delete_node(node) {
+                    return false;
+                }
+                let path = &graph.paths[node as usize];
+                let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
+                let real_path = real_store_dir.join(basename);
+                log::debug!("deleting '{path}'");
+                if let Ok(freed) = delete_store_path(&real_path) {
+                    bytes_freed.fetch_add(freed, Ordering::Relaxed);
+                }
+                live.end_delete_node(node);
+                true
+            })
+            .collect();
+        db.invalidate_paths(deleted.iter().map(|&n| graph.paths[n as usize].as_str()))?;
+        paths_deleted.fetch_add(deleted.len() as u64, Ordering::Relaxed);
     }
 
     // Unknown-on-disk paths: also parallel. tmp-* dirs hold flock through
     // deletion to avoid TOCTOU race with a builder.
-    let unknown_deleted = AtomicU64::new(0);
     if bytes_freed.load(Ordering::Relaxed) < max {
         unknown_on_disk.par_iter().for_each(|name| {
+            if !live.try_begin_delete_unknown(name) {
+                return;
+            }
             let real_path = real_store_dir.join(name);
             let _tmp_lock = if name.starts_with("tmp-") {
                 match try_lock_dir(&real_path) {
                     Some(f) => Some(f),
                     None => {
                         log::debug!("skipping locked tempdir {}", real_path.display());
+                        live.end_delete_unknown(name);
                         return;
                     }
                 }
@@ -269,12 +312,13 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
             if let Ok(freed) = delete_store_path(&real_path) {
                 bytes_freed.fetch_add(freed, Ordering::Relaxed);
             }
-            unknown_deleted.fetch_add(1, Ordering::Relaxed);
+            live.end_delete_unknown(name);
+            paths_deleted.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     let bytes_freed = bytes_freed.into_inner();
-    paths_deleted += unknown_deleted.into_inner() as usize;
+    let paths_deleted = paths_deleted.into_inner() as usize;
 
     // Clean up unused hard links in .links
     if !dry_run {
