@@ -211,24 +211,30 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
 
     // Bulk-invalidate, then delete from disk in parallel. Safe to crash
     // mid-delete: leftover dirs are picked up as unknown-on-disk next run.
-    //
-    // --max-freed needs actual freed bytes (narSize lies when paths share
-    // hard links), so we go one path at a time there. It's rare (auto-GC).
     let real_store_dir = db.real_store_dir.clone();
     let bytes_freed = AtomicU64::new(0);
     let mut paths_deleted = 0usize;
 
-    let chunk_size = if max_freed.is_some() {
-        1
-    } else {
-        dead_indices.len().max(1)
-    };
-
-    'outer: for chunk in dead_indices.chunks(chunk_size) {
-        if bytes_freed.load(Ordering::Relaxed) >= max {
+    // Fill each chunk by cumulative narSize up to the remaining --ensure-free
+    // budget, then re-check actual freed bytes (narSize over-reports for
+    // hard-linked paths). Without --ensure-free, max is u64::MAX: one chunk.
+    let mut cursor = 0usize;
+    while cursor < dead_indices.len() {
+        let freed_so_far = bytes_freed.load(Ordering::Relaxed);
+        if freed_so_far >= max {
             log::info!("deleted more than {max} bytes; stopping");
-            break 'outer;
+            break;
         }
+        let remaining = max - freed_so_far;
+        let mut estimated = 0u64;
+        let mut end = cursor;
+        while end < dead_indices.len() && estimated < remaining {
+            estimated = estimated.saturating_add(graph.nar_sizes[dead_indices[end] as usize]);
+            end += 1;
+        }
+        let chunk = &dead_indices[cursor..end];
+        cursor = end;
+
         db.invalidate_paths(chunk.iter().map(|&n| graph.paths[n as usize].as_str()))?;
         chunk.par_iter().for_each(|&node| {
             let path = &graph.paths[node as usize];
