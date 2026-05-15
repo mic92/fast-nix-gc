@@ -262,6 +262,29 @@ fn gc_max_freed_stops_early() {
 }
 
 #[test]
+fn gc_max_freed_batches_by_estimated_size() {
+    use fast_nix_gc::{
+        db::NixDb,
+        gc::{GcOptions, collect_garbage},
+    };
+    let store = TestStore::new();
+    // narSize 100 each, budget 250: first chunk = 3 paths (100+100+100 >= 250).
+    // Real on-disk usage exceeds 250 after that, so the loop stops at 3.
+    for i in 0..6 {
+        store.add_path(&format!("dead{i}"), 100);
+    }
+
+    let nix_db = NixDb::open(&store.store_dir, &store.state_dir).unwrap();
+    let opts = GcOptions {
+        max_freed: Some(250),
+        ..Default::default()
+    };
+    let (_, deleted) = collect_garbage(&nix_db, &opts).unwrap();
+
+    assert_eq!(deleted, 3, "first chunk must batch three paths by narSize");
+}
+
+#[test]
 fn gc_keep_recent_pins_recently_registered() {
     use fast_nix_gc::{
         db::NixDb,
