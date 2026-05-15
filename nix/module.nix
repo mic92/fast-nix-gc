@@ -156,6 +156,8 @@ in
 
       systemd.services.fast-nix-gc = {
         description = "Fast Nix Garbage Collector";
+        # `nix config show` for keep-derivations/keep-outputs.
+        path = [ config.nix.package ];
         serviceConfig = {
           Type = "oneshot";
           ExecStart = lib.escapeShellArgs (
