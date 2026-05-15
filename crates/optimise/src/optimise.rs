@@ -2,7 +2,9 @@
 
 use crate::hash::nar_hash_nix32;
 use anyhow::{Context, Result, bail};
-use fast_nix_common::{HashSet, db::NixDb, format_size};
+use fast_nix_common::{
+    HashSet, db::NixDb, format_size, make_store_writable, unshare_mount_namespace,
+};
 use harmonia_store_core::store_path::StoreDir;
 use nix::fcntl::{Flock, FlockArg};
 use std::fs;
@@ -325,6 +327,7 @@ fn shared_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
 pub async fn optimise_store(opts: Options) -> Result<Stats> {
     let links_dir = opts.store_dir.join(".links");
     if !opts.dry_run {
+        make_store_writable(&opts.store_dir)?;
         fs::create_dir_all(&links_dir)
             .with_context(|| format!("creating {}", links_dir.display()))?;
     }
@@ -467,6 +470,11 @@ pub fn cli_main() -> Result<()> {
     let opts = parse_args()?;
     let dry = opts.dry_run;
     let jobs = opts.jobs;
+
+    // Before tokio spawns its worker threads; see docs.
+    if !dry {
+        unshare_mount_namespace();
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(jobs)

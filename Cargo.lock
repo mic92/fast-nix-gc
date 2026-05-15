@@ -342,6 +342,8 @@ dependencies = [
  "anyhow",
  "foldhash 0.2.0",
  "harmonia-store-core",
+ "log",
+ "nix",
  "rusqlite",
 ]
 
