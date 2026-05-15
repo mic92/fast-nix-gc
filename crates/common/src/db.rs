@@ -41,8 +41,10 @@ impl NixDb {
             state_dir: state_dir.to_path_buf(),
             real_store_dir: store_dir.to_path_buf(),
             links_dir: store_dir.join(".links"),
-            keep_derivations: true,
-            keep_outputs: false,
+            // Read the resolved nix.conf via `nix config show`; defaults
+            // match Nix if it's not in PATH.
+            keep_derivations: crate::nix_config::bool_setting("keep-derivations", true),
+            keep_outputs: crate::nix_config::bool_setting("keep-outputs", false),
         })
     }
 

@@ -129,3 +129,4 @@ mod tests {
         assert_eq!(format_size(3 * 1024 * 1024 * 1024 / 2), "1.50 GiB");
     }
 }
+pub mod nix_config;

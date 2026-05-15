@@ -139,11 +139,6 @@ The GC takes the same `gc.lock` Nix does, so it won't race with
 conservative: paths gone from the DB but still on disk are picked up as
 unknown entries by the next GC.
 
-## Not implemented
-
-- Reading `keep-derivations`/`keep-outputs` from `nix.conf` (defaults are
-  used: `keep-derivations=true`, `keep-outputs=false`).
-
 ## FAQ
 
 **Could this have been implemented in upstream Nix?**
