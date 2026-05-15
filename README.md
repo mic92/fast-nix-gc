@@ -1,6 +1,8 @@
 # fast-nix-gc
 
-Faster `nix-collect-garbage` and `nix-store --optimise`.
+Faster `nix-collect-garbage` and `nix-store --optimise`. See
+[real-world timings](#real-world-timings) for a rough idea of how much
+faster.
 
 ## fast-nix-gc
 
@@ -145,3 +147,23 @@ unknown entries by the next GC.
 
 Yes, but C++ and concurrency is a scary combination,
 which is why I went with this implementation first.
+
+## Real-world timings
+
+Not a scientific benchmark — just `journalctl` data from a few of my
+machines after switching the daily GC timer from `nix-gc.service` to
+`fast-nix-gc.service`. Workloads differ between runs, sample sizes are
+small, and hardware varies. Take it as a rough indication of scale, not a
+controlled measurement.
+
+| Host | Store profile | `nix-gc` wall clock | `fast-nix-gc` wall clock | Rough speedup |
+| --- | --- | --- | --- | --- |
+| Laptop (large store, daily dev churn) | ~100k+ paths | 1m25s – 19m, median ≈ 7m | 5s – 20s | ~25–60× |
+| Build server (huge store, CI churn) | very large | 19m – 30m, avg ≈ 22m | 7s – 17s | ~80–180× |
+| Small VPS (tiny store) | small | 4s – 23s | 15s | ~1–1.5× |
+
+The speedup grows with store size: stock `nix-gc` pays a large fixed cost
+walking the whole live closure even when there's almost nothing to delete
+(near-idle runs still took minutes on the bigger machines), while
+`fast-nix-gc` stays in the single-digit-seconds range. On a tiny store
+the overhead is negligible either way and the two are roughly comparable.
