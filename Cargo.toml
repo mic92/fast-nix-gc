@@ -13,7 +13,7 @@ pico-args = "0.5"
 rayon = "1"
 walkdir = "2"
 anyhow = "1"
-nix = { version = "0.31", features = ["fs", "user", "dir", "mount", "sched", "socket"] }
+nix = { version = "0.31", features = ["fs", "user", "dir", "mount", "sched", "socket", "poll"] }
 log = { version = "0.4", features = ["std"] }
 rusqlite = "0.39"
 foldhash = "0.2"
