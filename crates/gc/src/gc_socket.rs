@@ -9,13 +9,17 @@ use crate::db::StoreGraph;
 use crate::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
 /// Liveness state shared between the deletion loop and the socket server.
 /// Roots from clients can only flip dead -> protected; `pending` tracks
@@ -132,7 +136,7 @@ impl LiveSet {
 /// removes the socket file, and joins the accept thread.
 pub struct GcSocketServer {
     socket_path: PathBuf,
-    listener_fd: RawFd,
+    shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -160,16 +164,17 @@ impl GcSocketServer {
         }
         let idx = Arc::new(idx);
         let store_prefix = graph.store_prefix.clone();
-        let listener_fd = listener.as_raw_fd();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let accept_shutdown = Arc::clone(&shutdown);
 
         let handle = std::thread::Builder::new()
             .name("gc-socket".into())
-            .spawn(move || accept_loop(listener, store_prefix, live, graph, idx))
+            .spawn(move || accept_loop(listener, store_prefix, live, graph, idx, accept_shutdown))
             .context("spawning gc-socket thread")?;
 
         Ok(GcSocketServer {
             socket_path,
-            listener_fd,
+            shutdown,
             handle: Some(handle),
         })
     }
@@ -177,10 +182,8 @@ impl GcSocketServer {
 
 impl Drop for GcSocketServer {
     fn drop(&mut self) {
-        // Unlink so no new client connects, then shutdown(2) to wake the
-        // blocking accept(); unlink alone does not interrupt it.
         let _ = fs::remove_file(&self.socket_path);
-        let _ = nix::sys::socket::shutdown(self.listener_fd, nix::sys::socket::Shutdown::Both);
+        self.shutdown.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -193,22 +196,36 @@ fn accept_loop(
     live: Arc<LiveSet>,
     graph: Arc<StoreGraph>,
     idx: Arc<HashMap<String, u32>>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    // The socket file is unlinked on shutdown; accept() then errors out.
-    while let Ok((stream, _)) = listener.accept() {
-        let store_prefix = store_prefix.clone();
-        let live = Arc::clone(&live);
-        let graph = Arc::clone(&graph);
-        let idx = Arc::clone(&idx);
-        // Each builder keeps its connection open for the duration of its
-        // build; handle them concurrently.
-        let _ = std::thread::Builder::new()
-            .name("gc-socket-conn".into())
-            .spawn(move || {
-                if let Err(e) = handle_client(stream, &store_prefix, &live, &graph, &idx) {
-                    log::debug!("gc-socket client: {e}");
-                }
-            });
+    while !shutdown.load(Ordering::Acquire) {
+        let pfd = PollFd::new(listener.as_fd(), PollFlags::POLLIN);
+        match poll(&mut [pfd], PollTimeout::from(10_u8)) {
+            Ok(0) | Err(_) => continue,
+            _ => {}
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let store_prefix = store_prefix.clone();
+                let live = Arc::clone(&live);
+                let graph = Arc::clone(&graph);
+                let idx = Arc::clone(&idx);
+                // Each builder keeps its connection open for the duration of
+                // its build; handle them concurrently.
+                let _ = std::thread::Builder::new()
+                    .name("gc-socket-conn".into())
+                    .spawn(move || {
+                        if let Err(e) = handle_client(stream, &store_prefix, &live, &graph, &idx) {
+                            log::debug!("gc-socket client: {e}");
+                        }
+                    });
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                log::debug!("gc-socket accept: {e}");
+                break;
+            }
+        }
     }
 }
 
@@ -259,6 +276,24 @@ mod tests {
             ref_targets,
             store_prefix: prefix.to_owned(),
         }
+    }
+
+    #[test]
+    fn drop_returns_when_idle_accept_loop_is_waiting() {
+        let g = Arc::new(graph("/nix/store/", &[]));
+        let live = Arc::new(LiveSet::new(0, HashSet::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let server = GcSocketServer::start(dir.path(), live, g).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            drop(server);
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("GcSocketServer::drop did not finish");
+        handle.join().unwrap();
     }
 
     #[test]
