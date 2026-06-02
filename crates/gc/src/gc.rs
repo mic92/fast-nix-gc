@@ -237,9 +237,27 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     let bytes_freed = AtomicU64::new(0);
     let paths_deleted = AtomicU64::new(0);
 
+    // Reverse edges among dead paths. A chunk has to take the dead
+    // referrers of everything it invalidates with it, otherwise a
+    // surviving row keeps references to deleted rows. Only needed when
+    // --ensure-free splits deletion into chunks; a single chunk is the
+    // whole dead set. Alive paths never reference dead ones.
+    let dead_referrers: Option<Vec<Vec<u32>>> = max_freed.map(|_| {
+        let mut rev = vec![Vec::new(); graph.len()];
+        for &n in &dead_indices {
+            for &m in graph.refs(n) {
+                if !alive[m as usize] && m != n {
+                    rev[m as usize].push(n);
+                }
+            }
+        }
+        rev
+    });
+
     // Fill each chunk by cumulative narSize up to the remaining --ensure-free
     // budget, then re-check actual freed bytes (narSize over-reports for
     // hard-linked paths). Without --ensure-free, max is u64::MAX: one chunk.
+    let mut in_chunk = vec![false; graph.len()];
     let mut cursor = 0usize;
     while cursor < dead_indices.len() {
         let freed_so_far = bytes_freed.load(Ordering::Relaxed);
@@ -248,25 +266,51 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
             break;
         }
         let remaining = max - freed_so_far;
+        let mut chunk: Vec<u32> = Vec::new();
         let mut estimated = 0u64;
-        let mut end = cursor;
-        while end < dead_indices.len() && estimated < remaining {
-            estimated = estimated.saturating_add(graph.nar_sizes[dead_indices[end] as usize]);
-            end += 1;
+        while cursor < dead_indices.len() && estimated < remaining {
+            let n = dead_indices[cursor];
+            cursor += 1;
+            if !in_chunk[n as usize] {
+                in_chunk[n as usize] = true;
+                estimated = estimated.saturating_add(graph.nar_sizes[n as usize]);
+                chunk.push(n);
+            }
         }
-        let chunk = &dead_indices[cursor..end];
-        cursor = end;
+        if chunk.is_empty() {
+            break;
+        }
+        // Close the chunk under dead referrers (see dead_referrers above).
+        if let Some(rev) = &dead_referrers {
+            let mut i = 0;
+            while i < chunk.len() {
+                for &r in &rev[chunk[i] as usize] {
+                    if !in_chunk[r as usize] {
+                        in_chunk[r as usize] = true;
+                        chunk.push(r);
+                    }
+                }
+                i += 1;
+            }
+        }
         // Snapshot-filter, don't pre-claim: protect() should wait for the
         // rayon-bounded in-flight set, not the whole chunk.
-        let claimed: Vec<u32> = chunk
-            .iter()
-            .copied()
-            .filter(|&n| !live.is_protected(n))
-            .collect();
-        // Disk first, DB second: paths protected between filter and unlink
-        // keep their DB entry. Crash mid-delete still self-heals via the
-        // unknown-on-disk scan next run.
-        let deleted: Vec<u32> = claimed
+        let (mut claimed, skipped): (Vec<u32>, Vec<u32>) =
+            chunk.iter().copied().partition(|&n| !live.is_protected(n));
+        // protect() marks closures atomically, but this filter reads one
+        // node at a time: it may have kept a reference whose referrer got
+        // protected a moment later. Drop the closures of skipped paths.
+        if !skipped.is_empty() {
+            let keep_out = graph.compute_closure(&skipped);
+            claimed.retain(|&n| !keep_out[n as usize]);
+        }
+        // Invalidate rows before unlinking: builders trust isValidPath(),
+        // so a path must never look valid after its disk entry is gone.
+        // Paths protected after this point stay on disk; their builder
+        // re-registers them or the next run collects them as
+        // unknown-on-disk. See alloy/gc_db_consistency.als.
+        db.invalidate_paths(claimed.iter().map(|&n| graph.paths[n as usize].as_str()))?;
+        let n_deleted = claimed
             .par_iter()
             .copied()
             .filter(|&node| {
@@ -283,9 +327,8 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
                 live.end_delete_node(node);
                 true
             })
-            .collect();
-        db.invalidate_paths(deleted.iter().map(|&n| graph.paths[n as usize].as_str()))?;
-        paths_deleted.fetch_add(deleted.len() as u64, Ordering::Relaxed);
+            .count();
+        paths_deleted.fetch_add(n_deleted as u64, Ordering::Relaxed);
     }
 
     // Unknown-on-disk paths: also parallel. tmp-* dirs hold flock through

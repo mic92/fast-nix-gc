@@ -46,4 +46,11 @@ rustPlatform.buildRustPackage {
     "-p"
     "fast-nix-optimise"
   ];
+
+  meta = {
+    description = "Faster nix-collect-garbage and nix-store --optimise";
+    homepage = "https://github.com/Mic92/fast-nix-gc";
+    license = lib.licenses.mit;
+    mainProgram = "fast-nix-gc";
+  };
 }

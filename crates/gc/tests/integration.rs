@@ -285,6 +285,43 @@ fn gc_max_freed_batches_by_estimated_size() {
 }
 
 #[test]
+fn gc_max_freed_referrer_never_outlives_reference() {
+    use fast_nix_gc::{
+        db::NixDb,
+        gc::{GcOptions, collect_garbage},
+    };
+    let store = TestStore::new();
+    // dep has the lower id, so the first chunk picks it while top still
+    // references it. Without referrer expansion the early stop leaves top
+    // valid in the DB pointing at a deleted row.
+    let dep = store.add_path("dead-dep", 100);
+    let top = store.add_path("dead-top", 100);
+    store.add_ref(&top, &dep);
+
+    let nix_db = NixDb::open(&store.store_dir, &store.state_dir).unwrap();
+    let opts = GcOptions {
+        max_freed: Some(1), // stop after the first chunk
+        ..Default::default()
+    };
+    collect_garbage(&nix_db, &opts).unwrap();
+
+    let conn = store.db();
+    let valid = |full: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM ValidPaths WHERE path = ?",
+            [full],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    // top surviving the early stop is fine, but only together with dep.
+    assert!(
+        valid(&top.full) == 0 || valid(&dep.full) == 1,
+        "referrer outlived its reference in the DB"
+    );
+}
+
+#[test]
 fn gc_keep_recent_pins_recently_registered() {
     use fast_nix_gc::{
         db::NixDb,
