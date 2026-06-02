@@ -1,12 +1,15 @@
 // Alloy 6 model of the GC deletion loop (crates/gc/src/gc.rs) and the
 // gc-socket protocol (crates/gc/src/gc_socket.rs).
 //
-// The proof is inductive: gcInit establishes `inv` and every event keeps
-// it, so `inv` holds on traces of any length. The only remaining bound is
-// the number of Path atoms in the universe. `inv` is `safety` (what GC
-// promises) plus `reachable` (bookkeeping needed to make safety inductive).
+// This is an inductive proof: gcInit establishes `inv` and every event
+// preserves it, so `inv` holds on traces of any length -- the 2-step bound
+// on the commands below is not a limitation, only the number of Path atoms
+// is. `inv` is `safety` (the properties we care about) strengthened with
+// `reachable`, which pins down the states the implementation can actually
+// be in; without it most events could fire from garbage states and break
+// safety.
 //
-// How code maps to events:
+// Mapping from code to events:
 //
 //   read_dir scan                            scanUnknown
 //   filter dead set + db.invalidate_paths()  chunkInvalidate
@@ -395,8 +398,8 @@ pred safety {
 }
 
 ----------------------------------------------------------------------------
--- Bookkeeping: states the implementation can be in. Needed to make
--- `safety` inductive.
+-- Strengthening invariant: rules out states the implementation cannot
+-- reach. `safety` alone is not inductive; these constraints close the gap.
 ----------------------------------------------------------------------------
 
 pred reachable {
@@ -417,7 +420,7 @@ pred reachable {
   protected in closure[(wantAck + acked) & Snap]
   protectedUnknown in (wantAck + acked) - Snap
 
-  -- the ack promise: nothing in an acked closure is mid-unlink
+  -- what an ack means: nothing in an acked closure is mid-unlink
   all r: acked & Snap | no closure[r] & pending
 
   -- claimed paths re-enter the DB only through rebuild, which requires
@@ -451,7 +454,8 @@ pred reachable {
 pred inv { safety and reachable }
 
 ----------------------------------------------------------------------------
--- Sanity: the invariant is satisfiable and every event can fire
+-- Sanity checks: make sure the invariant is satisfiable and no event is
+-- accidentally disabled (a vacuous induction step would prove nothing)
 ----------------------------------------------------------------------------
 
 run initialStateExists { gcInit } for 6 but 2 steps expect 1
@@ -475,13 +479,13 @@ run stepTempRootStale { inv and some p: Path | tempRootStale[p] } for 6 but 2 st
 -- The proof
 ----------------------------------------------------------------------------
 
--- Base case.
+-- Base case of the induction.
 check InitEstablishesInv {
   gcInit implies inv
 } for 6 but 2 steps
 
--- Induction step. Together with the base case this proves `safety` for
--- traces of any length.
+-- Induction step: any single event starting from `inv` lands back in
+-- `inv`. Together with the base case this covers traces of any length.
 check InvIsInductive {
   (inv and anyEvent) implies after inv
 } for 6 but 2 steps
