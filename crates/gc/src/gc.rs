@@ -334,6 +334,23 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     // Unknown-on-disk paths: also parallel. tmp-* dirs hold flock through
     // deletion to avoid TOCTOU race with a builder.
     if bytes_freed.load(Ordering::Relaxed) < max {
+        // A builder may have registered a scanned path after our graph
+        // snapshot and then exited, leaving its temp root file stale.
+        // Unlinking such a path would orphan its ValidPaths row, so
+        // re-check the DB first. Checking once up front is enough: any
+        // registration from here on goes through the gc-socket and is
+        // shielded by protected_unknown. See tempRootStale in
+        // alloy/gc_db_consistency.als.
+        let mut unknown_on_disk = unknown_on_disk;
+        unknown_on_disk.retain(
+            |name| match db.is_valid_path(&format!("{store_prefix}{name}")) {
+                Ok(valid) => !valid,
+                Err(e) => {
+                    log::warn!("skipping {store_prefix}{name}: validity check failed: {e}");
+                    false
+                }
+            },
+        );
         unknown_on_disk.par_iter().for_each(|name| {
             if !live.try_begin_delete_unknown(name) {
                 return;

@@ -191,6 +191,16 @@ impl NixDb {
         .collect()
     }
 
+    pub fn is_valid_path(&self, path: &str) -> Result<bool> {
+        // Cached: called once per unknown-on-disk entry, which can be
+        // many thousands after an interrupted nixos-install or nix copy.
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM ValidPaths WHERE path = ?")?;
+        let n: i64 = stmt.query_row([path], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
     /// Remove paths from the DB in a single transaction.
     pub fn invalidate_paths<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;

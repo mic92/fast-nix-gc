@@ -241,6 +241,72 @@ fn gc_removes_unknown_disk_entries() {
     assert!(!orphan.exists());
 }
 
+/// A path registered after the graph snapshot, whose owner exited right
+/// after the DB commit (stale temp root), shows up in the unknown-on-disk
+/// scan. GC must not unlink it: that would leave a ValidPaths row without
+/// a disk entry.
+#[test]
+fn gc_keeps_unknown_path_registered_after_snapshot() {
+    let store = TestStore::new();
+
+    // Anchor path so the store isn't empty.
+    let root = store.add_path("root", 10);
+    store.add_root("keep", &root);
+
+    // On disk before GC starts, not yet in the DB: shows up in the
+    // unknown-on-disk scan.
+    let basename = format!("{}-late", fake_hash("late"));
+    let late_path = store.store_dir.join(&basename);
+    fs::create_dir_all(&late_path).unwrap();
+    fs::write(late_path.join("file"), "data").unwrap();
+    let late_full = format!("{}/{basename}", store.store_dir.display());
+
+    // GC blocks on this fifo after the snapshot + unknown scan.
+    let fifo = store.state_dir.join("sync.fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits(0o600).unwrap()).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(&store.store_dir)
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .env("_FAST_NIX_GC_TEST_SYNC", &fifo)
+        .spawn()
+        .unwrap();
+
+    // Blocks until GC opened the read end, i.e. the snapshot and the
+    // unknown-on-disk scan are done.
+    let fifo_w = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+
+    // The "builder" registers the path; its temp root file is already gone.
+    store
+        .db()
+        .execute(
+            "INSERT INTO ValidPaths (path, hash, registrationTime, narSize) VALUES (?, ?, 2000, 4)",
+            rusqlite::params![late_full, format!("sha256:{}", fake_hash("late"))],
+        )
+        .unwrap();
+
+    drop(fifo_w);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let in_db = store
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM ValidPaths WHERE path = ?",
+            [&late_full],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+        > 0;
+    assert!(in_db, "registered path lost its ValidPaths row");
+    assert!(
+        late_path.exists(),
+        "disk entry deleted while ValidPaths row exists (stale DB entry)"
+    );
+}
+
 #[test]
 fn gc_max_freed_stops_early() {
     use fast_nix_gc::{
