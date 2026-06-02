@@ -14,6 +14,7 @@
 //   unlink + live.end_delete_node()          finishDelete
 //   chunk loop done                          chunksDone
 //   unlink unknown-on-disk entry             deleteUnknown
+//   stale temp root file removed             tempRootStale
 //   GC done                                  finishGc
 //   gc-socket protect / ack                  protectMark / protectAck
 //   builder rebuilds invalid paths           rebuild
@@ -42,8 +43,6 @@ sig Snap in Path {}
 sig Root in Path {}
 
 -- Paths with a temp root file written before GC acquired gc.lock.
--- TempRoot - Snap are shielded from the unknown-on-disk scan
--- (temp_root_basenames in gc.rs).
 sig TempRoot in Path {}
 
 fact staticStore {
@@ -65,6 +64,10 @@ fun deadSnap: set Path { Snap - aliveSnap }
 ----------------------------------------------------------------------------
 
 var sig dbValid in Path {}      -- rows in the ValidPaths table
+-- Temp root files still present (owner alive). find_temp_roots removes a
+-- file once it can flock it (owner died); only shield - Snap feeds
+-- temp_root_basenames, which shields the unknown-on-disk scan.
+var sig shield in TempRoot {}
 var sig onDisk in Path {}       -- entries present in /nix/store
 var sig protected in Path {}    -- LiveSet.protected (snapshot nodes)
 var sig protectedUnknown in Path {} -- LiveSet.protected_unknown (basenames)
@@ -88,6 +91,7 @@ one sig PC { var phase: one Phase }
 
 pred gcInit {
   dbValid = Snap
+  shield = TempRoot
   Snap in onDisk
   no protected
   no protectedUnknown
@@ -109,13 +113,27 @@ pred gcInit {
 -- (snapshot) nor in temp_root_basenames is recorded for later deletion.
 pred scanUnknown {
   PC.phase = Scanning
-  unknownList' = onDisk - Snap - TempRoot
+  unknownList' = onDisk - Snap - shield
   PC.phase' = Deleting
   -- frame
   dbValid' = dbValid and onDisk' = onDisk and protected' = protected
   protectedUnknown' = protectedUnknown and pending' = pending
   claimed' = claimed and diskDone' = diskDone and wantAck' = wantAck
-  acked' = acked and rebuilt' = rebuilt
+  acked' = acked and rebuilt' = rebuilt and shield' = shield
+}
+
+-- find_temp_roots flocks p's temp root file: the owner died, so the file
+-- is stale and removed. The owner may have registered p just before dying.
+pred tempRootStale[p: Path] {
+  PC.phase = Scanning
+  p in shield
+  shield' = shield - p
+  -- frame
+  dbValid' = dbValid and onDisk' = onDisk and protected' = protected
+  protectedUnknown' = protectedUnknown and pending' = pending
+  claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
+  wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  PC.phase' = PC.phase
 }
 
 -- One chunk: filter unclaimed dead paths against `protected`, then remove
@@ -138,6 +156,7 @@ pred chunkInvalidate {
   protectedUnknown' = protectedUnknown and pending' = pending
   diskDone' = diskDone and unknownList' = unknownList
   wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  shield' = shield
   PC.phase' = PC.phase
 }
 
@@ -151,6 +170,7 @@ pred beginDelete[p: Path] {
   protectedUnknown' = protectedUnknown and claimed' = claimed
   diskDone' = diskDone and unknownList' = unknownList
   wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  shield' = shield
   PC.phase' = PC.phase
 }
 
@@ -165,7 +185,7 @@ pred finishDelete[p: Path] {
   dbValid' = dbValid and protected' = protected
   protectedUnknown' = protectedUnknown and claimed' = claimed
   unknownList' = unknownList and wantAck' = wantAck and acked' = acked
-  rebuilt' = rebuilt and PC.phase' = PC.phase
+  rebuilt' = rebuilt and shield' = shield and PC.phase' = PC.phase
 }
 
 -- Every claimed path has been unlinked or skipped (protected); move on to
@@ -181,32 +201,37 @@ pred chunksDone {
   protectedUnknown' = protectedUnknown and pending' = pending
   claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
   wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  shield' = shield
 }
 
 -- live.try_begin_delete_unknown(p) + unlink: deletes a scanned entry unless
--- a builder protected it through the gc-socket in the meantime.
+-- a builder protected it through the gc-socket in the meantime or
+-- registered it after the graph snapshot (gc.rs re-checks ValidPaths
+-- before the unknown unlinks).
 pred deleteUnknown[p: Path] {
   PC.phase = UnknownDeleting
-  p in (unknownList & onDisk) - protectedUnknown
+  p in (unknownList & onDisk) - protectedUnknown - dbValid
   onDisk' = onDisk - p
   -- frame
   dbValid' = dbValid and protected' = protected
   protectedUnknown' = protectedUnknown and pending' = pending
   claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
   wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  shield' = shield
   PC.phase' = PC.phase
 }
 
 -- All unprotected unknown-on-disk entries are gone; GC finishes.
 pred finishGc {
   PC.phase = UnknownDeleting
-  unknownList & onDisk in protectedUnknown
+  unknownList & onDisk in protectedUnknown + dbValid
   PC.phase' = Finished
   -- frame
   dbValid' = dbValid and onDisk' = onDisk and protected' = protected
   protectedUnknown' = protectedUnknown and pending' = pending
   claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
   wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  shield' = shield
 }
 
 ----------------------------------------------------------------------------
@@ -231,7 +256,8 @@ pred protectMark[r: Path] {
   -- frame
   dbValid' = dbValid and onDisk' = onDisk and pending' = pending
   claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
-  acked' = acked and rebuilt' = rebuilt and PC.phase' = PC.phase
+  acked' = acked and rebuilt' = rebuilt and shield' = shield
+  PC.phase' = PC.phase
 }
 
 -- protect() returns and '1' is written: no closure node is mid-unlink.
@@ -245,7 +271,7 @@ pred protectAck[r: Path] {
   dbValid' = dbValid and onDisk' = onDisk and protected' = protected
   protectedUnknown' = protectedUnknown and pending' = pending
   claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
-  rebuilt' = rebuilt and PC.phase' = PC.phase
+  rebuilt' = rebuilt and shield' = shield and PC.phase' = PC.phase
 }
 
 -- The builder rebuilds what it can see is missing, walking top-down and
@@ -267,16 +293,17 @@ pred rebuild[r: Path] {
   protected' = protected and protectedUnknown' = protectedUnknown
   pending' = pending and claimed' = claimed and diskDone' = diskDone
   unknownList' = unknownList and wantAck' = wantAck and acked' = acked
+  shield' = shield
   PC.phase' = PC.phase
 }
 
 -- A builder registers a path that is not in the snapshot: store dir entry
--- plus ValidPaths row. Needs a pre-GC temp root or an acked protection,
--- and valid references.
+-- plus ValidPaths row. Needs a live temp root file (owner still alive) or
+-- an acked protection, and valid references.
 pred registerFresh[p: Path] {
   PC.phase in gcActive + Finished
   p in Path - Snap
-  p in TempRoot + (acked - Snap)
+  p in shield + (acked - Snap)
   p not in onDisk
   p.refs in dbValid
   onDisk' = onDisk + p
@@ -285,7 +312,7 @@ pred registerFresh[p: Path] {
   protected' = protected and protectedUnknown' = protectedUnknown
   pending' = pending and claimed' = claimed and diskDone' = diskDone
   unknownList' = unknownList and wantAck' = wantAck and acked' = acked
-  rebuilt' = rebuilt and PC.phase' = PC.phase
+  rebuilt' = rebuilt and shield' = shield and PC.phase' = PC.phase
 }
 
 ----------------------------------------------------------------------------
@@ -303,6 +330,7 @@ pred crash {
   protectedUnknown' = protectedUnknown and pending' = pending
   claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
   wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  shield' = shield
 }
 
 -- The next GC run after a crash, as one atomic step and without builders
@@ -319,7 +347,7 @@ pred recover {
   protected' = protected and protectedUnknown' = protectedUnknown
   pending' = pending and claimed' = claimed and diskDone' = diskDone
   unknownList' = unknownList and wantAck' = wantAck and acked' = acked
-  rebuilt' = rebuilt
+  rebuilt' = rebuilt and shield' = shield
 }
 
 pred stutter {
@@ -327,13 +355,14 @@ pred stutter {
   protectedUnknown' = protectedUnknown and pending' = pending
   claimed' = claimed and diskDone' = diskDone and unknownList' = unknownList
   wantAck' = wantAck and acked' = acked and rebuilt' = rebuilt
+  shield' = shield
   PC.phase' = PC.phase
 }
 
 pred anyEvent {
   (some p: Path | beginDelete[p] or finishDelete[p] or deleteUnknown[p]
                   or protectMark[p] or protectAck[p] or rebuild[p]
-                  or registerFresh[p])
+                  or registerFresh[p] or tempRootStale[p])
   or scanUnknown or chunkInvalidate or chunksDone or finishGc
   or crash or recover or stutter
 }
@@ -402,10 +431,9 @@ pred reachable {
   -- fresh paths enter the DB only via a temp root or an acked protection
   dbValid - Snap in TempRoot + (acked - Snap)
 
-  -- the scan never lists snapshot or temp-rooted paths, and registered
-  -- paths in the list are shielded by protected_unknown
-  unknownList in Path - Snap - TempRoot
-  unknownList & dbValid in protectedUnknown
+  -- the scan never lists snapshot paths or paths whose temp root file was
+  -- still live at scan time
+  unknownList in Path - Snap - shield
 
   -- after the scan, disk entries outside the snapshot are scanned junk,
   -- temp-rooted, or registered by an acked builder
@@ -417,7 +445,7 @@ pred reachable {
     (no unknownList and no claimed and no diskDone and no pending)
   PC.phase in UnknownDeleting + Finished implies
     (claimed in diskDone + protected and no pending)
-  PC.phase = Finished implies unknownList & onDisk in protectedUnknown
+  PC.phase = Finished implies unknownList & onDisk in protectedUnknown + dbValid
 }
 
 pred inv { safety and reachable }
@@ -441,6 +469,7 @@ run stepDeleteUnknown { inv and some p: Path | deleteUnknown[p] } for 6 but 2 st
 run stepRebuild { inv and some p: Path | rebuild[p] } for 6 but 2 steps expect 1
 run stepRegisterFresh { inv and some p: Path | registerFresh[p] } for 6 but 2 steps expect 1
 run stepRecover { inv and recover } for 6 but 2 steps expect 1
+run stepTempRootStale { inv and some p: Path | tempRootStale[p] } for 6 but 2 steps expect 1
 
 ----------------------------------------------------------------------------
 -- The proof
