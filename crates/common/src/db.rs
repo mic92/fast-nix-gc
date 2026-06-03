@@ -48,6 +48,16 @@ impl NixDb {
         })
     }
 
+    /// Check whether a table exists in the SQLite database.
+    fn has_table(conn: &Connection, name: &str) -> Result<bool> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Load the full reference graph into memory. Walking it as an
     /// in-memory CSR is far cheaper than N point queries.
     pub fn load_graph(&self) -> Result<StoreGraph> {
@@ -109,31 +119,77 @@ impl NixDb {
         // Refs table: direct references between store paths.
         add_edges(&self.conn, "SELECT referrer, reference FROM Refs")?;
 
-        // output → deriver via ValidPaths.deriver (input-addressed)
+        // Edge directions mirror Nix's computeFSClosure (misc.cc), which
+        // the GC calls with includeOutputs = keep-outputs and
+        // includeDerivers = keep-derivations:
+        //   keep-derivations: alive output keeps its drv alive (output→drv)
+        //   keep-outputs:     alive drv keeps its outputs alive (drv→output)
+        //
+        // drv↔output mappings come from three places:
+        // - ValidPaths.deriver (all Nix versions; also covers CA outputs of
+        //   Nix ≤2.34, whose Realisations table keys drvPath by content
+        //   hash and so can't be joined against ValidPaths)
+        // - DerivationOutputs (input-addressed)
+        // - BuildTraceV3 (CA/dynamic derivations, Nix ≥2.35): drvPath is a
+        //   store path *basename*, outputPath a full store path. Created
+        //   lazily; skip if absent.
+        let has_build_trace = (self.keep_derivations || self.keep_outputs)
+            && Self::has_table(&self.conn, "BuildTraceV3")?;
+        let store_prefix = format!("{}/", self.store_dir.display());
+
         if self.keep_derivations {
+            // output → drv via ValidPaths.deriver
             add_edges(
                 &self.conn,
                 "SELECT v.id, d.id FROM ValidPaths v \
                  JOIN ValidPaths d ON d.path = v.deriver \
                  WHERE v.deriver IS NOT NULL",
             )?;
-        }
-
-        // output ↔ drv via DerivationOutputs (content-addressed).
-        // keep-derivations: output→drv and drv→output.
-        // keep-outputs: output→drv and drv→output.
-        // Both need the same two edge sets, so add each at most once.
-        if self.keep_derivations || self.keep_outputs {
+            // output → drv via DerivationOutputs (covers outputs whose
+            // deriver column is unset)
             add_edges(
                 &self.conn,
                 "SELECT o.id, do2.drv FROM ValidPaths o \
                  JOIN DerivationOutputs do2 ON do2.path = o.path",
             )?;
+            if has_build_trace {
+                // output → drv via BuildTraceV3
+                add_edges(
+                    &self.conn,
+                    &format!(
+                        "SELECT o.id, d.id FROM BuildTraceV3 bt \
+                         JOIN ValidPaths o ON o.path = bt.outputPath \
+                         JOIN ValidPaths d ON d.path = '{store_prefix}' || bt.drvPath"
+                    ),
+                )?;
+            }
+        }
+
+        if self.keep_outputs {
+            // drv → output via DerivationOutputs
             add_edges(
                 &self.conn,
                 "SELECT do2.drv, o.id FROM DerivationOutputs do2 \
                  JOIN ValidPaths o ON o.path = do2.path",
             )?;
+            // drv → output via ValidPaths.deriver
+            add_edges(
+                &self.conn,
+                "SELECT d.id, v.id FROM ValidPaths v \
+                 JOIN ValidPaths d ON d.path = v.deriver \
+                 WHERE v.deriver IS NOT NULL",
+            )?;
+            if has_build_trace {
+                // drv → output via BuildTraceV3
+                add_edges(
+                    &self.conn,
+                    &format!(
+                        "SELECT d.id, o.id FROM BuildTraceV3 bt \
+                         JOIN ValidPaths d ON d.path = '{store_prefix}' || bt.drvPath \
+                         JOIN ValidPaths o ON o.path = bt.outputPath"
+                    ),
+                )?;
+            }
         }
 
         self.conn.execute_batch("COMMIT")?;

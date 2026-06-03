@@ -22,6 +22,8 @@ fast-nix-gc [OPTIONS]
       --dry-run                 Show what would be done
       --ensure-free SIZE        Free until SIZE is available (e.g. 50G)
       --keep-recent SPEC        Keep paths registered within SPEC (e.g. 1d)
+      --keep-outputs BOOL       Override the keep-outputs nix.conf setting
+      --keep-derivations BOOL   Override the keep-derivations nix.conf setting
       --store-dir PATH          Nix store directory [default: /nix/store]
       --state-dir PATH          Nix state directory [default: /nix/var/nix]
 ```
@@ -131,8 +133,12 @@ or `nix develop -c cargo build --release`. Without flakes:
 Roots are gathered from `gcroots/`, `profiles/`, `temproots/`, and running
 processes (`/proc` on Linux; `libproc` syscalls on macOS instead of
 shelling out to `lsof`). Stale temp-root files and dangling auto-roots are
-removed. `keep-derivations` and `keep-outputs` are honored, including for
-content-addressed derivations (via the `DerivationOutputs` table). The
+removed. `keep-derivations` and `keep-outputs` are honored with the same
+edge semantics as `nix-store --gc`: an alive output keeps its derivation
+(`keep-derivations`), an alive derivation keeps its outputs
+(`keep-outputs`). This includes content-addressed / dynamic derivations:
+drv↔output mappings are read from `ValidPaths.deriver`,
+`DerivationOutputs`, and the `BuildTraceV3` table (Nix ≥2.35). The
 store is remounted read-write on NixOS where it's bind-mounted read-only.
 `tmp-*` build dirs are skipped if a builder still holds the lock.
 
