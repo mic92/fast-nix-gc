@@ -189,10 +189,11 @@ fn scan_blob_for_store_paths(blob: &str, store_prefix: &str, unchecked: &mut Has
             .find(|c: char| !is_store_path_char(c))
             .map(|e| after + e)
             .unwrap_or(blob.len());
-        if end > after {
-            add_unchecked(store_prefix, &blob[abs..end], unchecked);
-        }
-        search_from = end.max(abs + 1);
+        // A bare prefix (end == after) is rejected by add_unchecked's
+        // basename validation, no need to special-case it.
+        add_unchecked(store_prefix, &blob[abs..end], unchecked);
+        // end >= after > abs, so progress is guaranteed.
+        search_from = end;
     }
 }
 
@@ -279,6 +280,32 @@ mod runtime_roots {
             "/proc/sys/kernel/poweroff_cmd",
         ] {
             read_file_root(Path::new(f), store_prefix, unchecked);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn read_file_root_trims_and_extracts() {
+            let tmp = tempfile::tempdir().unwrap();
+            let f = tmp.path().join("modprobe");
+            let sp = "/nix/store/00000000000000000000000000000000-modprobe";
+            fs::write(&f, format!("{sp}/bin/modprobe\n")).unwrap();
+            let mut set = HashSet::default();
+            read_file_root(&f, "/nix/store", &mut set);
+            assert!(set.contains(sp), "{set:?}");
+        }
+
+        #[test]
+        fn read_file_root_ignores_non_store_paths() {
+            let tmp = tempfile::tempdir().unwrap();
+            let f = tmp.path().join("modprobe");
+            fs::write(&f, "/sbin/modprobe\n").unwrap();
+            let mut set = HashSet::default();
+            read_file_root(&f, "/nix/store", &mut set);
+            assert!(set.is_empty());
         }
     }
 }
@@ -645,4 +672,115 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
     }
 
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = "abcdefghijklmnopqrstuvwxyz012345"; // 32 chars
+
+    #[test]
+    fn store_path_basename_grammar() {
+        assert!(is_store_path_basename(&format!("{HASH}-foo")));
+        assert!(is_store_path_basename(&format!("{HASH}-foo-1.2+x_y?z=")));
+        // Too short / missing dash at position 32.
+        assert!(!is_store_path_basename("short"));
+        assert!(!is_store_path_basename(&format!("{HASH}xfoo")));
+        // Uppercase or invalid chars in hash part.
+        assert!(!is_store_path_basename(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345-foo"
+        ));
+        // Invalid char in name part: both halves must hold.
+        assert!(!is_store_path_basename(&format!("{HASH}-foo bar")));
+        // .links and .. must never look like store paths.
+        assert!(!is_store_path_basename(".links"));
+        assert!(!is_store_path_basename(".."));
+    }
+
+    #[test]
+    fn is_in_store_requires_separator() {
+        assert!(is_in_store("/nix/store", "/nix/store/abc"));
+        assert!(!is_in_store("/nix/store", "/nix/store"));
+        assert!(!is_in_store("/nix/store", "/nix/store-other/abc"));
+        assert!(!is_in_store("/nix/store", "/somewhere/else"));
+    }
+
+    #[test]
+    fn extract_store_path_takes_first_component() {
+        let sp = format!("/nix/store/{HASH}-foo");
+        assert_eq!(
+            extract_store_path("/nix/store", &format!("{sp}/bin/bar")),
+            Some(sp.clone())
+        );
+        assert_eq!(extract_store_path("/nix/store", &sp), Some(sp));
+        assert_eq!(
+            extract_store_path("/nix/store", "/nix/store/.links/x"),
+            None
+        );
+        assert_eq!(extract_store_path("/nix/store", "/nix/store"), None);
+    }
+
+    #[test]
+    fn scan_blob_finds_embedded_store_paths() {
+        let sp1 = format!("/nix/store/{HASH}-foo");
+        let sp2 = format!("/nix/store/{HASH}-bar");
+        // Paths embedded mid-blob with trailing junk, and one ending the blob.
+        let blob = format!("PATH={sp1}/bin:other LD={sp2}");
+        let mut set = HashSet::default();
+        scan_blob_for_store_paths(&blob, "/nix/store", &mut set);
+        assert_eq!(set.len(), 2, "{set:?}");
+        assert!(set.contains(&sp1));
+        assert!(set.contains(&sp2));
+    }
+
+    #[test]
+    fn scan_blob_ignores_bare_prefix() {
+        let mut set = HashSet::default();
+        scan_blob_for_store_paths("x /nix/store/ y /nix/store::", "/nix/store", &mut set);
+        assert!(set.is_empty(), "{set:?}");
+    }
+
+    #[test]
+    fn temp_roots_reads_locked_skips_stale_and_junk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("temproots");
+        fs::create_dir_all(&dir).unwrap();
+
+        let sp1 = format!("/nix/store/{HASH}-live1");
+        let sp2 = format!("/nix/store/{HASH}-live2");
+        // Live file: owner (us) holds the write lock; trailing segment
+        // without NUL is a partial write and must be dropped.
+        let live = dir.join("12345");
+        fs::write(&live, format!("{sp1}\0{sp2}\0partial")).unwrap();
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&live)
+            .unwrap();
+        let _lock =
+            nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+
+        // Stale file: no lock held, must be removed and ignored.
+        let stale = dir.join("999");
+        fs::write(&stale, format!("/nix/store/{HASH}-stale\0")).unwrap();
+
+        // Hidden and non-PID files are not temp roots.
+        fs::write(dir.join(".keep"), b"junk").unwrap();
+        fs::write(dir.join("notapid"), format!("/nix/store/{HASH}-junk\0")).unwrap();
+
+        let roots = find_temp_roots(tmp.path()).unwrap();
+        assert!(roots.contains(&sp1));
+        assert!(roots.contains(&sp2));
+        assert_eq!(roots.len(), 2, "{roots:?}");
+        assert!(!stale.exists(), "stale temp roots file removed");
+        assert!(dir.join(".keep").exists());
+        assert!(dir.join("notapid").exists());
+    }
+
+    #[test]
+    fn temp_roots_missing_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(find_temp_roots(tmp.path()).unwrap().is_empty());
+    }
 }

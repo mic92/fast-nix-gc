@@ -50,7 +50,10 @@ fn delete_store_path(real_path: &Path) -> Result<u64> {
         }
         if entry.file_type().is_dir() {
             if fs::remove_dir(p).is_err() {
-                let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+                // rmdir needs write permission on the parent, not on p.
+                if let Some(parent) = p.parent() {
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+                }
                 let _ = fs::remove_dir(p);
             }
         } else if fs::remove_file(p).is_err() {
@@ -182,7 +185,8 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         for entry in entries.flatten() {
             let raw = entry.file_name();
             let name = raw.to_string_lossy();
-            if name == "." || name == ".." || name == ".links" {
+            // read_dir never yields "." or "..".
+            if name == ".links" {
                 continue;
             }
             if bidx.idx_of_basename(name.as_ref()).is_none()
@@ -428,4 +432,82 @@ fn clean_links(links_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn delete_store_path_missing_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(delete_store_path(&tmp.path().join("gone")).unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_store_path_other_stat_errors_propagate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("file");
+        fs::write(&f, b"x").unwrap();
+        // ENOTDIR, not ENOENT: must not be treated as "already gone".
+        assert!(delete_store_path(&f.join("sub")).is_err());
+    }
+
+    #[test]
+    fn delete_store_path_file_reports_disk_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("file");
+        fs::write(&f, vec![1u8; 5000]).unwrap();
+        let expected = fs::symlink_metadata(&f).unwrap().blocks() * 512;
+        assert!(expected > 0);
+        assert_eq!(delete_store_path(&f).unwrap(), expected);
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn delete_store_path_removes_readonly_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("pkg");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/file"), vec![1u8; 5000]).unwrap();
+        let mut expected = 0;
+        for e in walkdir::WalkDir::new(&dir) {
+            expected += e.unwrap().metadata().unwrap().blocks() * 512;
+        }
+        // Store paths are read-only on disk.
+        fs::set_permissions(dir.join("sub/file"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(dir.join("sub"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert_eq!(delete_store_path(&dir).unwrap(), expected);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn try_lock_dir_none_while_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = try_lock_dir(tmp.path()).expect("unheld dir is lockable");
+        assert!(try_lock_dir(tmp.path()).is_none(), "held dir must not lock");
+        drop(lock);
+    }
+
+    #[test]
+    fn clean_links_removes_only_unreferenced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let links = tmp.path().join(".links");
+        fs::create_dir_all(&links).unwrap();
+        let dead = links.join("dead");
+        fs::write(&dead, b"unreferenced").unwrap();
+        let shared = links.join("shared");
+        fs::write(&shared, b"referenced").unwrap();
+        fs::hard_link(&shared, tmp.path().join("user")).unwrap();
+
+        clean_links(&links).unwrap();
+
+        assert!(!dead.exists());
+        assert!(shared.exists());
+        // Missing .links dir is not an error.
+        clean_links(&tmp.path().join("nope")).unwrap();
+    }
 }

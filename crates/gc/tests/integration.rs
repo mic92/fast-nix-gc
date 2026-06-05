@@ -40,11 +40,28 @@ fn fake_hash(name: &str) -> String {
 
 impl TestStore {
     fn new() -> Self {
+        Self::new_inner(false)
+    }
+
+    /// Store dir is a symlink to the real directory, like /nix/store on
+    /// installs with a relocated store. The kernel reports canonical
+    /// paths for fds, the DB stores logical ones.
+    fn new_symlinked() -> Self {
+        Self::new_inner(true)
+    }
+
+    fn new_inner(symlink_store: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("store");
         let state_dir = dir.path().join("state");
 
-        fs::create_dir_all(&store_dir).unwrap();
+        if symlink_store {
+            let real = dir.path().join("store-real");
+            fs::create_dir_all(&real).unwrap();
+            std::os::unix::fs::symlink(&real, &store_dir).unwrap();
+        } else {
+            fs::create_dir_all(&store_dir).unwrap();
+        }
         for d in ["db", "gcroots", "profiles", "temproots"] {
             fs::create_dir_all(state_dir.join(d)).unwrap();
         }
@@ -220,9 +237,72 @@ fn gc_dry_run_does_not_delete() {
 
     assert!(dead.path.exists() && store.in_db(&dead));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // narSize of "dead" is 500; the estimate must be summed correctly.
     assert!(
-        stdout.contains("1 store paths would be deleted"),
+        stdout.contains("1 store paths would be deleted (~500 bytes)"),
         "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn gc_removes_unlocked_tmp_dir() {
+    let store = TestStore::new();
+
+    let tmp = store.store_dir.join("tmp-build-9999");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("left-over"), "data").unwrap();
+
+    let out = store.run_gc_ok(&[]);
+
+    assert!(!tmp.exists(), "unlocked tmp dir is garbage");
+    // No shared links exist, so no savings line must be logged.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("currently saving"), "stderr: {stderr}");
+}
+
+#[test]
+fn gc_dry_run_counts_unknown_on_disk() {
+    let store = TestStore::new();
+
+    let unknown = store
+        .store_dir
+        .join(format!("{}-unknown", fake_hash("unknown")));
+    fs::create_dir_all(&unknown).unwrap();
+
+    let out = store.run_gc_ok(&["--dry-run"]);
+
+    assert!(unknown.exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 store paths would be deleted (~0 bytes)"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn gc_cleans_unused_links_only_when_not_dry_run() {
+    let store = TestStore::new();
+
+    let links = store.store_dir.join(".links");
+    let dead_link = links.join("deadlink");
+    fs::write(&dead_link, "unreferenced").unwrap();
+    let shared_link = links.join("sharedlink");
+    fs::write(&shared_link, "referenced").unwrap();
+    let pkg = store.add_path("linked", 100);
+    store.add_root("linked-root", &pkg);
+    fs::hard_link(&shared_link, pkg.path.join("shared")).unwrap();
+
+    store.run_gc_ok(&["--dry-run"]);
+    assert!(dead_link.exists(), "dry run must not clean links");
+
+    let out = store.run_gc_ok(&[]);
+    assert!(!dead_link.exists(), "unreferenced link removed");
+    assert!(shared_link.exists(), "referenced link kept");
+    // "referenced" is 10 bytes with nlink 2: savings = (2-1)*10.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("currently saving 10 bytes"),
+        "stderr: {stderr}"
     );
 }
 
@@ -461,6 +541,51 @@ fn gc_keeps_runtime_roots_from_open_fd() {
     // Inherit an fd into the child so the path shows up in the GC's
     // own /proc/<pid>/fd. Sandboxes can't always inspect other PIDs.
     let f = fs::File::open(held.path.join("file")).unwrap();
+    let raw_fd = f.as_raw_fd();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"));
+    cmd.arg("--store-dir")
+        .arg(&store.store_dir)
+        .arg("--state-dir")
+        .arg(&store.state_dir);
+    unsafe {
+        cmd.pre_exec(move || {
+            use nix::fcntl::{F_GETFD, F_SETFD, FdFlag, fcntl};
+            use std::os::fd::BorrowedFd;
+            let fd = BorrowedFd::borrow_raw(raw_fd);
+            if let Ok(flags) = fcntl(fd, F_GETFD) {
+                let mut flags = FdFlag::from_bits_truncate(flags);
+                flags.remove(FdFlag::FD_CLOEXEC);
+                let _ = fcntl(fd, F_SETFD(flags));
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    drop(f);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(held.path.exists() && store.in_db(&held));
+    assert!(!trash.path.exists());
+}
+
+#[test]
+fn gc_rebases_canonical_runtime_roots_to_logical_store() {
+    use std::os::unix::process::CommandExt;
+    let store = TestStore::new_symlinked();
+
+    let held = store.add_path("held", 100);
+    let trash = store.add_path("trash", 100);
+
+    // Open via the canonical (symlink-resolved) path; /proc/<pid>/fd will
+    // report that path, which must be rebased to the logical store prefix
+    // before DB validation.
+    let canon = fs::canonicalize(held.path.join("file")).unwrap();
+    assert_ne!(canon, held.path.join("file"));
+    let f = fs::File::open(&canon).unwrap();
     let raw_fd = f.as_raw_fd();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"));
     cmd.arg("--store-dir")
