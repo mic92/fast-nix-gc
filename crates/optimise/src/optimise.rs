@@ -24,6 +24,10 @@ pub struct Stats {
     pub link_enospc: AtomicU64,
     /// Files or paths skipped because of I/O errors (logged, not fatal).
     pub errors: AtomicU64,
+    /// Dry-run only: hashes whose .links entry would be created by this
+    /// run. The first file of a hash becomes the canonical entry and
+    /// frees nothing; only subsequent duplicates count.
+    dry_run_links: std::sync::Mutex<HashSet<String>>,
 }
 
 pub struct Options {
@@ -220,8 +224,13 @@ async fn optimise_file(
         }
         Err(_) => {
             if opts.dry_run {
-                stats.files_linked.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
+                // First occurrence becomes the canonical link (no rename,
+                // nothing freed); only duplicates would be replaced.
+                let first = stats.dry_run_links.lock().unwrap().insert(hash.clone());
+                if !first {
+                    stats.files_linked.fetch_add(1, Ordering::Relaxed);
+                    stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
+                }
                 return Ok(());
             }
             match fs::hard_link(&path, &link_path) {
@@ -250,12 +259,8 @@ async fn optimise_file(
     if lmeta.ino() == meta.ino() {
         return Ok(());
     }
-    if opts.dry_run {
-        stats.files_linked.fetch_add(1, Ordering::Relaxed);
-        stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
-        return Ok(());
-    }
     // Size mismatch means a corrupt .links entry; don't merge.
+    // Checked before the dry-run accounting: a real run skips these too.
     if lmeta.len() != meta.len() {
         log::warn!(
             "link {} has size {} but file {} has size {}; skipping",
@@ -264,6 +269,11 @@ async fn optimise_file(
             path.display(),
             meta.len()
         );
+        return Ok(());
+    }
+    if opts.dry_run {
+        stats.files_linked.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
         return Ok(());
     }
 
@@ -788,11 +798,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dry_run_counts_but_does_not_link() {
         let (stats, f1, f2, _tmp) = run_two_identical(0, true).await;
-        // .links is empty in dry-run, so both files count as linkable.
-        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 2);
+        // The first file would become the canonical .links entry and
+        // frees nothing; only the duplicate counts — matching a real run.
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 1);
         assert_eq!(
             stats.bytes_freed.load(Ordering::Relaxed),
-            2 * CONTENT.len() as u64
+            CONTENT.len() as u64
         );
         assert_ne!(
             fs::metadata(&f1).unwrap().ino(),
