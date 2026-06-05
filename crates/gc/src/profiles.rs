@@ -116,15 +116,28 @@ fn delete_generations_older_than(profile: &Path, cutoff: SystemTime, dry_run: bo
     };
     let gens = find_generation_links(profile)?;
 
+    let mtime_of = |path: &Path| -> Option<SystemTime> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        Some(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+    };
+
+    // Like Nix (profiles.cc deleteGenerationsOlderThan): keep the newest
+    // generation older than the cutoff. It was the active one at the
+    // requested point in time, and the user wants to be able to roll back
+    // to it.
+    let newest_older = gens
+        .iter()
+        .rev()
+        .find(|(path, _)| mtime_of(path).is_some_and(|t| t < cutoff))
+        .map(|(_, g)| *g);
+
     for (path, r#gen) in &gens {
-        if *r#gen == current {
+        if *r#gen == current || Some(*r#gen) == newest_older {
             continue;
         }
-        let meta = match fs::symlink_metadata(path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Some(mtime) = mtime_of(path) else {
+            continue;
         };
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if mtime < cutoff {
             if dry_run {
                 log::info!("would remove (old): {}", path.display());
@@ -313,15 +326,23 @@ mod tests {
             );
         }
 
-        // Cutoff exactly at gen 2's mtime: only gen 1 (strictly older) goes.
-        // Gen 4 is current and always kept.
+        // Cutoff exactly at gen 2's mtime: gen 1 is the only strictly
+        // older generation, and as the one active at the cutoff it is
+        // kept for rollback (Nix semantics). Nothing goes.
         let cutoff = base + Duration::from_secs(200);
         delete_generations_older_than(&profile, cutoff, true).unwrap();
         assert_eq!(existing_gens(dir.path()), vec![1, 2, 3, 4]);
         delete_generations_older_than(&profile, cutoff, false).unwrap();
-        assert_eq!(existing_gens(dir.path()), vec![2, 3, 4]);
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3, 4]);
 
-        // Cutoff after all gens: everything but current goes.
+        // Cutoff between gen 3 and 4: gens 1-3 are older, gen 3 was
+        // active at the cutoff and is kept; 1 and 2 go.
+        let cutoff = base + Duration::from_secs(350);
+        delete_generations_older_than(&profile, cutoff, false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![3, 4]);
+
+        // Cutoff after all gens: the newest older one is the current
+        // generation itself, so everything else goes.
         delete_generations_older_than(&profile, base + Duration::from_secs(10_000), false).unwrap();
         assert_eq!(existing_gens(dir.path()), vec![4]);
     }
