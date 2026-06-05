@@ -6,7 +6,6 @@ use fast_nix_common::{
     HashSet, db::NixDb, format_size, make_store_writable, unshare_mount_namespace,
 };
 use harmonia_store_core::store_path::StoreDir;
-use nix::fcntl::{Flock, FlockArg};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -318,31 +317,6 @@ fn libc_emlink() -> i32 {
     nix::errno::Errno::EMLINK as i32
 }
 
-/// Hold gc.lock shared for the whole run so the GC (which takes it
-/// exclusive) cannot delete paths from under us.
-fn shared_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock_path = state_dir.join("gc.lock");
-    // 0600 like Nix's openLockFile.
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    match Flock::lock(f, FlockArg::LockSharedNonblock) {
-        Ok(l) => Ok(l),
-        Err((f, _)) => {
-            log::info!("waiting for garbage collector to finish...");
-            Flock::lock(f, FlockArg::LockShared)
-                .map_err(|(_, e)| e)
-                .context("acquiring shared gc.lock")
-        }
-    }
-}
-
 pub async fn optimise_store(opts: Options) -> Result<Stats> {
     let links_dir = opts.store_dir.join(".links");
     if !opts.dry_run {
@@ -351,12 +325,21 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
             .with_context(|| format!("creating {}", links_dir.display()))?;
     }
 
-    let _gc_lock = shared_gc_lock(&opts.state_dir)?;
+    // Like Nix's optimiseStore: register each path as a temp root right
+    // before working on it instead of holding gc.lock shared for the
+    // whole (potentially hours-long) run, which would block every GC.
+    // Dry runs touch nothing and take no roots.
+    let mut temp_roots = if opts.dry_run {
+        None
+    } else {
+        Some(fast_nix_common::temp_roots::TempRoots::create(
+            &opts.state_dir,
+        )?)
+    };
 
     let db = NixDb::open(&opts.store_dir, &opts.state_dir)?;
     let store_dir_typed: StoreDir = db.store_dir_typed()?;
     let paths = db.valid_store_paths()?;
-    drop(db);
     log::info!("optimising {} store paths", paths.len());
 
     let t0 = std::time::Instant::now();
@@ -392,6 +375,16 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
                 let stats = stats.clone();
                 let tx = file_tx.clone();
                 let store_path = store_path.to_absolute_path(&store_dir_typed);
+                if let Some(tr) = temp_roots.as_mut() {
+                    let path_str = store_path.to_string_lossy();
+                    tr.add(&path_str)
+                        .with_context(|| format!("registering temp root {path_str}"))?;
+                    // A GC running before our registration may have deleted
+                    // the path (Nix: "path was GC'ed, probably").
+                    if !db.is_valid_path(&path_str)? {
+                        continue;
+                    }
+                }
                 walks.spawn(async move {
                     let files = tokio::task::spawn_blocking(
                         move || -> Result<Vec<(PathBuf, fs::Metadata)>> {
@@ -467,7 +460,10 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
             while let Some(res) = walks.join_next().await {
                 res??;
             }
-            anyhow::Ok(())
+            // Hand the temp roots back so they outlive the link workers,
+            // not just the walks: dropping them here would release the
+            // temproots flock while files are still being replaced.
+            anyhow::Ok(temp_roots)
         })
     };
 
@@ -491,10 +487,11 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
         }
     }
 
-    producer.await??;
+    let temp_roots = producer.await??;
     while let Some(res) = tasks.join_next().await {
         res??;
     }
+    drop(temp_roots);
 
     Ok(Arc::into_inner(stats).expect("all tasks joined"))
 }
@@ -875,6 +872,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registers_temp_roots_for_optimised_paths() {
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let p1 = mk_store_path(&store, "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-q", CONTENT);
+        let p2 = mk_store_path(&store, "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-r", CONTENT);
+        mk_db(&state, &[&p1, &p2]);
+
+        optimise_store(run_opts(&store, &state)).await.unwrap();
+
+        // Every optimised path was registered in our temproots file, so a
+        // concurrent GC would not have deleted it mid-replace.
+        let roots = fs::read(state.join("temproots").join(std::process::id().to_string())).unwrap();
+        let roots = String::from_utf8(roots).unwrap();
+        assert!(roots.contains(p1.to_str().unwrap()), "{roots}");
+        assert!(roots.contains(p2.to_str().unwrap()), "{roots}");
+        unlock(&p1);
+        unlock(&p2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dry_run_takes_no_temp_roots() {
+        let (_stats, _f1, _f2, tmp) = run_two_identical(0, true).await;
+        let tr = tmp
+            .path()
+            .join("state/temproots")
+            .join(std::process::id().to_string());
+        assert!(!tr.exists(), "dry run must not write temp roots");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unreadable_path_is_skipped_not_fatal() {
         if nix::unistd::geteuid().is_root() {
             return; // root bypasses permission checks
@@ -897,20 +926,5 @@ mod tests {
         unlock(&bad);
         unlock(&p1);
         unlock(&p2);
-    }
-
-    #[test]
-    fn shared_gc_lock_blocks_exclusive() {
-        use nix::fcntl::{Flock, FlockArg};
-        let tmp = tempdir().unwrap();
-        let _shared = shared_gc_lock(tmp.path()).unwrap();
-        // GC takes the lock exclusive; while we hold it shared, the
-        // exclusive non-blocking attempt must fail.
-        let f = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(tmp.path().join("gc.lock"))
-            .unwrap();
-        assert!(Flock::lock(f, FlockArg::LockExclusiveNonblock).is_err());
     }
 }

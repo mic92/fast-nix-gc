@@ -131,3 +131,4 @@ mod tests {
     }
 }
 pub mod nix_config;
+pub mod temp_roots;
