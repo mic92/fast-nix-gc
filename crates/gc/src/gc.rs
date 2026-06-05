@@ -160,11 +160,22 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     // Track those by basename so the unknown-on-disk scan won't
     // delete them.
     let mut temp_root_basenames: crate::HashSet<String> = crate::HashSet::default();
+    // Hash parts of all temp roots. Nix matches temp roots by hash part so
+    // that sibling files of an active build (`<path>.lock`, `<path>.chroot`,
+    // `<path>.check`) are protected too; the unknown-on-disk scan must not
+    // delete a lock file another builder currently holds.
+    let mut temp_root_hashes: crate::HashSet<String> = crate::HashSet::default();
     for tr in find_temp_roots(&db.state_dir)? {
+        if let Some(b) = tr.strip_prefix(graph.store_prefix.as_str()) {
+            if b.len() > 32 && b.as_bytes()[32] == b'-' {
+                temp_root_hashes.insert(b[..32].to_owned());
+            }
+            if bidx.idx_of_basename(b).is_none() {
+                temp_root_basenames.insert(b.to_owned());
+            }
+        }
         if let Some(i) = bidx.idx_of(&tr) {
             roots.push(i);
-        } else if let Some(b) = tr.strip_prefix(graph.store_prefix.as_str()) {
-            temp_root_basenames.insert(b.to_owned());
         }
     }
     // --keep-recent: treat recently registered paths as roots.
@@ -201,8 +212,14 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
             if name == ".links" {
                 continue;
             }
+            // An entry shares an active build's hash part if its first 32
+            // chars match (covers `<path>.lock` and friends).
+            let hash_part_active = name.len() >= 32
+                && name.is_char_boundary(32)
+                && temp_root_hashes.contains(&name[..32]);
             if bidx.idx_of_basename(name.as_ref()).is_none()
                 && !temp_root_basenames.contains(name.as_ref())
+                && !hash_part_active
             {
                 unknown_on_disk.push(name.into_owned());
             }

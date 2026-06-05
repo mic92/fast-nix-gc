@@ -1015,3 +1015,40 @@ fn gc_removes_dangling_auto_root() {
         "dangling auto root must be removed"
     );
 }
+
+#[test]
+fn gc_keeps_lock_file_of_active_build() {
+    let store = TestStore::new();
+
+    // Builder holds a temp root for the path it is building; its .lock
+    // sibling (not in the DB) shares the hash part and must survive.
+    let alive = store.add_path("being-built", 100);
+    let basename = alive
+        .full
+        .strip_prefix(&format!("{}/", store.store_dir.display()))
+        .unwrap();
+    let lock_file = store.store_dir.join(format!("{basename}.lock"));
+    fs::write(&lock_file, "").unwrap();
+    // Unrelated stale lock file: still garbage.
+    let stale_lock = store
+        .store_dir
+        .join(format!("{}-stale.lock", fake_hash("stale")));
+    fs::write(&stale_lock, "").unwrap();
+
+    let tmp_file = store.state_dir.join("temproots/4242");
+    let mut data = alive.full.clone().into_bytes();
+    data.push(0);
+    fs::write(&tmp_file, &data).unwrap();
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&tmp_file)
+        .unwrap();
+    let lock = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockSharedNonblock).unwrap();
+
+    store.run_gc_ok(&[]);
+
+    assert!(lock_file.exists(), "active build's .lock file deleted");
+    assert!(!stale_lock.exists(), "stale lock file kept");
+    drop(lock);
+}
