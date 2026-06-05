@@ -123,6 +123,32 @@ fn main() -> Result<()> {
         bail!("--ensure-free cannot be combined with --dry-run");
     }
 
+    // Validate every time spec before any destructive work; a bad
+    // --keep-recent must not surface only after generations were deleted.
+    let delete_older_cutoff = args
+        .delete_older_than
+        .as_deref()
+        .map(profiles::parse_older_than)
+        .transpose()?;
+    let keep_recent_after = args
+        .keep_recent
+        .as_deref()
+        .map(profiles::parse_older_than)
+        .transpose()?
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
+
+    if args.delete_old {
+        profiles::profile_dirs(&args.state_dir)
+            .par_iter()
+            .try_for_each(|dir| {
+                profiles::remove_old_generations(dir, delete_older_cutoff, args.dry_run)
+            })?;
+    }
+
     let max_freed = if let Some(target) = args.ensure_free {
         let avail = available_bytes(&args.store_dir)?;
         if avail >= target {
@@ -139,29 +165,6 @@ fn main() -> Result<()> {
     } else {
         None
     };
-
-    if args.delete_old {
-        let cutoff = args
-            .delete_older_than
-            .as_deref()
-            .map(profiles::parse_older_than)
-            .transpose()?;
-
-        profiles::profile_dirs(&args.state_dir)
-            .par_iter()
-            .try_for_each(|dir| profiles::remove_old_generations(dir, cutoff, args.dry_run))?;
-    }
-
-    let keep_recent_after = args
-        .keep_recent
-        .as_deref()
-        .map(profiles::parse_older_than)
-        .transpose()?
-        .map(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        });
 
     let mut store = db::NixDb::open(&args.store_dir, &args.state_dir)?;
     if let Some(v) = args.keep_outputs {
