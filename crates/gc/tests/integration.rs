@@ -731,24 +731,24 @@ fn gc_keeps_deriver_of_alive_path() {
 }
 
 #[test]
-fn gc_keeps_ca_deriver_via_derivation_outputs() {
+fn gc_deletes_drv_when_output_deriver_is_unset() {
     let store = TestStore::new();
 
-    // Content-addressed derivation: deriver field is NOT set on the output,
-    // but DerivationOutputs maps drv -> output path.
+    // Output with NULL deriver but a DerivationOutputs row: Nix's
+    // keep-derivations pins drvs only via ValidPaths.deriver (gc.cc
+    // requires queryPathInfo(out)->deriver == drv), so the drv is garbage.
     let drv = store.add_path("ca-pkg.drv", 50);
     let out = store.add_path("ca-pkg", 200);
-    // No set_deriver — simulates CA where ValidPaths.deriver is NULL.
     store.add_drv_output(&drv, "out", &out);
     store.add_root("ca-out-root", &out);
-    let trash = store.add_path("trash", 100);
 
     store.run_gc_ok(&[]);
 
-    // keep-derivations: CA output keeps its .drv alive via DerivationOutputs.
     assert!(out.path.exists(), "output deleted");
-    assert!(drv.path.exists(), "CA deriver deleted despite alive output");
-    assert!(!trash.path.exists());
+    assert!(
+        !drv.path.exists(),
+        "drv kept despite no alive path naming it as deriver"
+    );
 }
 
 #[test]
@@ -882,24 +882,28 @@ fn gc_keeps_ca_output_via_build_trace() {
 }
 
 #[test]
-fn gc_keeps_ca_deriver_via_build_trace() {
-    // Alive CA output should keep its drv alive via BuildTraceV3.
+fn gc_keeps_ca_deriver_via_deriver_field_not_build_trace() {
+    // An alive CA output keeps its drv only through ValidPaths.deriver,
+    // like Nix; a BuildTraceV3 row alone must not pin the drv (the
+    // output may have been rebuilt by a newer drv since).
     let store = TestStore::new();
 
+    let stale_drv = store.add_path("dyn-pkg-old.drv", 50);
     let drv = store.add_path("dyn-pkg.drv", 50);
     let out = store.add_path("dyn-pkg-out", 200);
+    store.add_build_trace(&stale_drv, "out", &out);
     store.add_build_trace(&drv, "out", &out);
+    store.set_deriver(&out, &drv);
     store.add_root("out-root", &out);
-    let trash = store.add_path("trash", 100);
 
     store.run_gc_ok(&[]);
 
     assert!(out.path.exists(), "output deleted");
+    assert!(drv.path.exists(), "deriver deleted despite alive output");
     assert!(
-        drv.path.exists(),
-        "CA deriver deleted despite alive output (BuildTraceV3)"
+        !stale_drv.path.exists(),
+        "stale drv kept via BuildTraceV3 alone"
     );
-    assert!(!trash.path.exists());
 }
 
 #[test]

@@ -14,12 +14,11 @@ pub struct NixDb {
     pub real_store_dir: PathBuf,
     pub links_dir: PathBuf,
     /// Mirror of Nix's `keep-derivations` setting (default: true).
-    /// When set, .drv files of alive outputs are kept alive, and alive
-    /// .drv files keep their outputs alive.
+    /// When set, an alive path keeps its deriver (`ValidPaths.deriver`)
+    /// alive.
     pub keep_derivations: bool,
     /// Mirror of Nix's `keep-outputs` setting (default: false).
-    /// When set, outputs of alive derivations are kept alive, and alive
-    /// outputs keep their derivers alive.
+    /// When set, an alive .drv file keeps its outputs alive.
     pub keep_outputs: bool,
 }
 
@@ -162,22 +161,31 @@ impl NixDb {
         // Refs table: direct references between store paths.
         add_edges(&self.conn, "SELECT referrer, reference FROM Refs", &[])?;
 
-        // Edge directions mirror Nix's computeFSClosure (misc.cc), which
-        // the GC calls with includeOutputs = keep-outputs and
-        // includeDerivers = keep-derivations:
-        //   keep-derivations: alive output keeps its drv alive (output→drv)
-        //   keep-outputs:     alive drv keeps its outputs alive (drv→output)
+        // Edge directions mirror exactly what Nix's GC propagates
+        // (gc.cc maybeDeleteReferrersClosure + misc.cc computeFSClosure
+        // with includeOutputs = keep-outputs, includeDerivers =
+        // keep-derivations):
         //
-        // drv↔output mappings come from three places:
-        // - ValidPaths.deriver (all Nix versions; also covers CA outputs of
-        //   Nix ≤2.34, whose Realisations table keys drvPath by content
-        //   hash and so can't be joined against ValidPaths)
-        // - DerivationOutputs (input-addressed)
-        // - BuildTraceV3 (CA/dynamic derivations, Nix ≥2.35): drvPath is a
-        //   store path *basename*, outputPath a full store path. Created
-        //   lazily; skip if absent.
-        let has_build_trace = (self.keep_derivations || self.keep_outputs)
-            && Self::has_table(&self.conn, "BuildTraceV3")?;
+        //   keep-derivations: an alive path keeps `info->deriver` alive.
+        //     Edge output→drv via ValidPaths.deriver ONLY. The referrer
+        //     walk's condition (output of drv with deriver == drv) is a
+        //     subset of this. Nix does NOT pin a drv merely because a
+        //     DerivationOutputs/BuildTraceV3 row maps one of its outputs:
+        //     if the output's deriver is a different (newer) drv, the old
+        //     drv is garbage.
+        //
+        //   keep-outputs: an alive drv keeps its outputs alive.
+        //     Edge drv→output via the drv's output map: DerivationOutputs
+        //     for input-addressed outputs, BuildTraceV3 for CA/dynamic
+        //     outputs (Nix ≥2.35; drvPath is a store path *basename*,
+        //     outputPath a full store path; created lazily, skip if
+        //     absent), plus ValidPaths.deriver. The deriver edge is a
+        //     subset of Nix's relation (deriver == drv implies the path is
+        //     in the drv's output map) and is the only usable drv→output
+        //     mapping for CA outputs of Nix ≤2.34, whose Realisations
+        //     table keys drvPath by content hash and so can't be joined
+        //     against ValidPaths.
+        let has_build_trace = self.keep_outputs && Self::has_table(&self.conn, "BuildTraceV3")?;
         let store_prefix = format!("{}/", self.store_dir.display());
 
         if self.keep_derivations {
@@ -189,24 +197,6 @@ impl NixDb {
                  WHERE v.deriver IS NOT NULL",
                 &[],
             )?;
-            // output → drv via DerivationOutputs (covers outputs whose
-            // deriver column is unset)
-            add_edges(
-                &self.conn,
-                "SELECT o.id, do2.drv FROM ValidPaths o \
-                 JOIN DerivationOutputs do2 ON do2.path = o.path",
-                &[],
-            )?;
-            if has_build_trace {
-                // output → drv via BuildTraceV3
-                add_edges(
-                    &self.conn,
-                    "SELECT o.id, d.id FROM BuildTraceV3 bt \
-                     JOIN ValidPaths o ON o.path = bt.outputPath \
-                     JOIN ValidPaths d ON d.path = ? || bt.drvPath",
-                    &[&store_prefix],
-                )?;
-            }
         }
 
         if self.keep_outputs {
@@ -217,7 +207,8 @@ impl NixDb {
                  JOIN ValidPaths o ON o.path = do2.path",
                 &[],
             )?;
-            // drv → output via ValidPaths.deriver
+            // drv → output via ValidPaths.deriver (covers Realisations-era
+            // CA outputs; see the edge-direction comment above)
             add_edges(
                 &self.conn,
                 "SELECT d.id, v.id FROM ValidPaths v \
@@ -633,7 +624,8 @@ mod tests {
         assert_eq!(g.refs(iout), &[idrv]);
         assert!(g.refs(idrv).is_empty());
 
-        // keep-outputs adds the reverse edge.
+        // keep-outputs: the deriver field alone pins the output (it is
+        // the only drv→output mapping for Realisations-era CA outputs).
         db.keep_outputs = true;
         let g = db.load_graph().unwrap();
         assert_eq!(g.refs(idrv), &[iout]);
@@ -661,12 +653,16 @@ mod tests {
             ))
             .unwrap();
 
+        // keep-derivations pins drvs only via the deriver field; a
+        // BuildTraceV3 row alone must not create an output→drv edge
+        // (the output may have been rebuilt by a newer drv).
         db.keep_derivations = true;
         let g = db.load_graph().unwrap();
         let iout = g.paths.iter().position(|p| p.ends_with("-pkg")).unwrap() as u32;
         let idrv = g.paths.iter().position(|p| p.ends_with(".drv")).unwrap() as u32;
-        assert_eq!(g.refs(iout), &[idrv]);
+        assert!(g.refs(iout).is_empty());
 
+        // keep-outputs pins CA outputs of an alive drv via BuildTraceV3.
         db.keep_derivations = false;
         db.keep_outputs = true;
         let g = db.load_graph().unwrap();
