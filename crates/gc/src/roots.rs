@@ -343,7 +343,9 @@ mod runtime_roots {
     const PROC_PIDLISTFDS: c_int = 1;
     const PROC_PIDVNODEPATHINFO: c_int = 9;
     const PROC_PIDREGIONPATHINFO: c_int = 8;
-    const PROC_PIDFDVNODEPATHINFO: c_int = 1;
+    // proc_info.h: PROC_PIDFDVNODEINFO is 1 and carries no path;
+    // PATHINFO is 2.
+    const PROC_PIDFDVNODEPATHINFO: c_int = 2;
     const PROX_FDTYPE_VNODE: u32 = 1;
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
     const MAXPATHLEN: usize = 1024;
