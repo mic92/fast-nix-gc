@@ -96,7 +96,11 @@ fn replace_with_link(path: &Path, link_path: &Path, store_dir: &Path) -> Result<
 
     let restore = scopeguard(parent, must_toggle);
 
-    let tmp = parent.join(format!(
+    // The temp link lives in the store root, like Nix's makeTempPath
+    // (optimise-store.cc): a crash must leave the stray file *outside* the
+    // store path, where the next GC removes it as unknown-on-disk. Inside
+    // the path it would permanently corrupt the path's NAR contents.
+    let tmp = store_dir.join(format!(
         ".tmp-link-{}-{}",
         std::process::id(),
         rand_suffix()
