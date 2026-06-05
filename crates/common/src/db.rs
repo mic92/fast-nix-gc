@@ -25,20 +25,34 @@ pub struct NixDb {
 
 impl NixDb {
     pub fn open(store_dir: &Path, state_dir: &Path) -> Result<Self> {
+        Self::open_with_mode(store_dir, state_dir, false)
+    }
+
+    /// Read-only open for dry runs: no journal-mode flip, no write lock,
+    /// works on a read-only filesystem.
+    pub fn open_read_only(store_dir: &Path, state_dir: &Path) -> Result<Self> {
+        Self::open_with_mode(store_dir, state_dir, true)
+    }
+
+    fn open_with_mode(store_dir: &Path, state_dir: &Path, read_only: bool) -> Result<Self> {
         // "/nix/store/" must equal "/nix/store": every prefix comparison
         // against DB paths appends its own '/'. A trailing slash would make
         // the basename index empty and the whole store look dead.
         let store_dir = normalize_dir(store_dir);
         let store_dir = store_dir.as_path();
         let db_path = state_dir.join("db/db.sqlite");
-        let conn = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening {}", db_path.display()))?;
+        let rw_flag = if read_only {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        };
+        let conn = Connection::open_with_flags(&db_path, rw_flag | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_context(|| format!("opening {}", db_path.display()))?;
 
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        if !read_only {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
         // Nix's schema relies on FK actions (DerivationOutputs/Refs rows
         // cascade when a ValidPaths row goes away), but SQLite only honors
         // them with the pragma on. Without it every invalidation leaks

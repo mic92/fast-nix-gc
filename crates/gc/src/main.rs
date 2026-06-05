@@ -148,7 +148,17 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut store = db::NixDb::open(&args.store_dir, &args.state_dir)?;
+    let mut store = if args.dry_run {
+        // No DB writes happen in a dry run; don't take write locks or
+        // flip the journal mode. A WAL database without its -shm/-wal
+        // sidecars can't be opened read-only, so fall back to read-write.
+        db::NixDb::open_read_only(&args.store_dir, &args.state_dir).or_else(|e| {
+            log::debug!("read-only open failed ({e:#}); retrying read-write");
+            db::NixDb::open(&args.store_dir, &args.state_dir)
+        })?
+    } else {
+        db::NixDb::open(&args.store_dir, &args.state_dir)?
+    };
     if let Some(v) = args.keep_outputs {
         store.keep_outputs = v;
     }
