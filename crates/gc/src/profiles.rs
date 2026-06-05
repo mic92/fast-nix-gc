@@ -86,7 +86,63 @@ fn current_generation(profile: &Path) -> Result<Option<u64>> {
     Ok(None)
 }
 
+/// Lock held while mutating a profile's generations, interoperable with
+/// Nix's PathLocks protocol (pathlocks.cc): flock(2) on "<profile>.lock",
+/// stale detection via a non-empty file, deletion marker on release.
+struct ProfileLock {
+    lock_path: PathBuf,
+    file: fs::File,
+}
+
+impl ProfileLock {
+    fn acquire(profile: &Path) -> Result<ProfileLock> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut name = profile.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        let lock_path = profile.with_file_name(name);
+        loop {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)
+                .with_context(|| format!("opening {}", lock_path.display()))?;
+            loop {
+                if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(nix::libc::EINTR) {
+                    return Err(err).with_context(|| format!("locking {}", lock_path.display()));
+                }
+            }
+            // Stale check (Nix protocol): a non-empty lock file was marked
+            // and unlinked by its previous holder; retry on a fresh inode.
+            if file.metadata()?.len() != 0 {
+                continue;
+            }
+            return Ok(ProfileLock { lock_path, file });
+        }
+    }
+}
+
+impl Drop for ProfileLock {
+    fn drop(&mut self) {
+        use std::io::Write;
+        // Nix's deleteLockFile: write the deletion marker, then unlink.
+        // The flock itself is released when the fd closes.
+        let _ = self.file.write_all(b"d");
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
 fn delete_old_generations(profile: &Path, dry_run: bool) -> Result<()> {
+    // Serialize against nix-env/nixos-rebuild generation switches, which
+    // take the same lock (profiles.cc lockProfile).
+    let _lock = ProfileLock::acquire(profile)?;
     // Fail closed: if we cannot tell which generation is active (profile
     // gone or pointing at something that isn't a generation link),
     // deleting "all but current" would delete the active system too.
@@ -114,6 +170,7 @@ fn delete_old_generations(profile: &Path, dry_run: bool) -> Result<()> {
 }
 
 fn delete_generations_older_than(profile: &Path, cutoff: SystemTime, dry_run: bool) -> Result<()> {
+    let _lock = ProfileLock::acquire(profile)?;
     // Same fail-closed rule as delete_old_generations.
     let Some(current) = current_generation(profile)? else {
         log::warn!(
@@ -407,6 +464,20 @@ mod tests {
                 assert!(dirs.contains(&PathBuf::from(home).join(".local/state/nix/profiles")));
             }
         }
+    }
+
+    #[test]
+    fn profile_lock_acquire_release_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("system");
+        let lock_path = dir.path().join("system.lock");
+        {
+            let _lock = ProfileLock::acquire(&profile).unwrap();
+            assert!(lock_path.exists());
+        }
+        // Released locks are unlinked (Nix deleteLockFile protocol).
+        assert!(!lock_path.exists());
+        let _lock = ProfileLock::acquire(&profile).unwrap();
     }
 
     #[test]
