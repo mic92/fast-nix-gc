@@ -232,6 +232,12 @@ impl NixDb {
             }
         }
 
+        // CSR offsets are u32; refuse to build a graph the index type
+        // cannot address instead of silently wrapping.
+        anyhow::ensure!(
+            edges.len() <= u32::MAX as usize,
+            "store has more than 2^32 reference edges"
+        );
 
         let mut ref_offsets = vec![0u32; n + 1];
         for &(from, _) in &edges {
