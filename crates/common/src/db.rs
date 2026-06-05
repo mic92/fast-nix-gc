@@ -25,6 +25,11 @@ pub struct NixDb {
 
 impl NixDb {
     pub fn open(store_dir: &Path, state_dir: &Path) -> Result<Self> {
+        // "/nix/store/" must equal "/nix/store": every prefix comparison
+        // against DB paths appends its own '/'. A trailing slash would make
+        // the basename index empty and the whole store look dead.
+        let store_dir = normalize_dir(store_dir);
+        let store_dir = store_dir.as_path();
         let db_path = state_dir.join("db/db.sqlite");
         let conn = Connection::open_with_flags(
             &db_path,
@@ -298,6 +303,17 @@ impl NixDb {
             }
         }
     }
+}
+
+/// Strip trailing slashes (but keep a bare "/").
+fn normalize_dir(dir: &Path) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = dir.as_os_str().as_bytes();
+    let mut end = bytes.len();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(bytes[..end].to_vec()))
 }
 
 /// In-memory snapshot of the store reference graph in CSR layout.

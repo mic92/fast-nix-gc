@@ -899,3 +899,50 @@ fn gc_keeps_ca_deriver_via_build_trace() {
     );
     assert!(!trash.path.exists());
 }
+
+#[test]
+fn gc_store_dir_trailing_slash_is_normalized() {
+    // "--store-dir /path/" must behave like "--store-dir /path"; an
+    // unnormalized prefix would make every DB path look dead.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    store.add_root("lib-root", &lib);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(format!("{}/", store.store_dir.display()))
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(lib.path.exists() && store.in_db(&lib), "live path deleted");
+}
+
+#[test]
+fn gc_refuses_store_dir_mismatching_db() {
+    // A store dir that matches no DB path means the DB belongs to a
+    // different store; deleting "garbage" would wipe everything.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    store.add_root("lib-root", &lib);
+
+    let other = store.dir.path().join("other-store");
+    fs::create_dir_all(&other).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(&other)
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "GC must refuse a mismatched store dir"
+    );
+    assert!(lib.path.exists() && store.in_db(&lib));
+}

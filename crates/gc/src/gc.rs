@@ -139,6 +139,18 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
 
     let bidx = BasenameIndex::new(&graph);
 
+    // A --store-dir that doesn't match the DB contents (wrong directory)
+    // would make every root lookup miss and every DB path look dead,
+    // wiping the store. Refuse to proceed.
+    if !graph.is_empty() && bidx.map.is_empty() {
+        anyhow::bail!(
+            "store dir {} does not match any path in the Nix database \
+             (e.g. {}); refusing to collect garbage",
+            db.store_dir.display(),
+            graph.paths[0],
+        );
+    }
+
     log::info!("finding garbage collector roots...");
     let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx);
 
