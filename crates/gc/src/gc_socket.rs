@@ -10,7 +10,7 @@ use crate::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -217,7 +217,13 @@ fn accept_loop(
     while !shutdown.load(Ordering::Acquire) {
         let pfd = PollFd::new(listener.as_fd(), PollFlags::POLLIN);
         match poll(&mut [pfd], PollTimeout::from(10_u8)) {
-            Ok(0) | Err(_) => continue,
+            Ok(0) => continue,
+            Err(e) => {
+                // Don't hot-spin if poll fails persistently.
+                log::debug!("gc-socket poll: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
             _ => {}
         }
         match listener.accept() {
@@ -238,8 +244,11 @@ fn accept_loop(
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) => {
-                log::debug!("gc-socket accept: {e}");
-                break;
+                // Transient failures (EMFILE/ENFILE/ECONNABORTED) must not
+                // kill the server: builders would stall for the rest of the
+                // GC. Back off briefly and keep accepting.
+                log::warn!("gc-socket accept: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
@@ -252,13 +261,20 @@ fn handle_client(
     graph: &StoreGraph,
     idx: &HashMap<String, u32>,
 ) -> Result<()> {
+    // Paths are bounded; a peer that streams gigabytes without a newline
+    // must not OOM the GC (the socket is world-writable, like Nix's).
+    const MAX_LINE: u64 = 64 * 1024;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let n = reader.by_ref().take(MAX_LINE).read_line(&mut line)?;
+        if n == 0 {
             return Ok(());
+        }
+        if n as u64 == MAX_LINE && !line.ends_with('\n') {
+            anyhow::bail!("gc-socket: line too long");
         }
         let path = line.trim_end_matches('\n');
         if let Some(basename) = path.strip_prefix(store_prefix).filter(|b| !b.is_empty()) {
