@@ -138,23 +138,24 @@ impl NixDb {
         let n = paths.len();
         let mut edges: Vec<(u32, u32)> = Vec::new();
 
-        let mut add_edges = |conn: &Connection, sql: &str| -> Result<()> {
-            let mut stmt = conn.prepare(sql)?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let from_id: i64 = row.get(0)?;
-                let to_id: i64 = row.get(1)?;
-                let from = *id_to_idx.get(from_id as usize).unwrap_or(&MISSING);
-                let to = *id_to_idx.get(to_id as usize).unwrap_or(&MISSING);
-                if from != MISSING && to != MISSING {
-                    edges.push((from, to));
+        let mut add_edges =
+            |conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<()> {
+                let mut stmt = conn.prepare(sql)?;
+                let mut rows = stmt.query(params)?;
+                while let Some(row) = rows.next()? {
+                    let from_id: i64 = row.get(0)?;
+                    let to_id: i64 = row.get(1)?;
+                    let from = *id_to_idx.get(from_id as usize).unwrap_or(&MISSING);
+                    let to = *id_to_idx.get(to_id as usize).unwrap_or(&MISSING);
+                    if from != MISSING && to != MISSING {
+                        edges.push((from, to));
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
 
         // Refs table: direct references between store paths.
-        add_edges(&self.conn, "SELECT referrer, reference FROM Refs")?;
+        add_edges(&self.conn, "SELECT referrer, reference FROM Refs", &[])?;
 
         // Edge directions mirror Nix's computeFSClosure (misc.cc), which
         // the GC calls with includeOutputs = keep-outputs and
@@ -181,6 +182,7 @@ impl NixDb {
                 "SELECT v.id, d.id FROM ValidPaths v \
                  JOIN ValidPaths d ON d.path = v.deriver \
                  WHERE v.deriver IS NOT NULL",
+                &[],
             )?;
             // output → drv via DerivationOutputs (covers outputs whose
             // deriver column is unset)
@@ -188,16 +190,16 @@ impl NixDb {
                 &self.conn,
                 "SELECT o.id, do2.drv FROM ValidPaths o \
                  JOIN DerivationOutputs do2 ON do2.path = o.path",
+                &[],
             )?;
             if has_build_trace {
                 // output → drv via BuildTraceV3
                 add_edges(
                     &self.conn,
-                    &format!(
-                        "SELECT o.id, d.id FROM BuildTraceV3 bt \
-                         JOIN ValidPaths o ON o.path = bt.outputPath \
-                         JOIN ValidPaths d ON d.path = '{store_prefix}' || bt.drvPath"
-                    ),
+                    "SELECT o.id, d.id FROM BuildTraceV3 bt \
+                     JOIN ValidPaths o ON o.path = bt.outputPath \
+                     JOIN ValidPaths d ON d.path = ? || bt.drvPath",
+                    &[&store_prefix],
                 )?;
             }
         }
@@ -208,6 +210,7 @@ impl NixDb {
                 &self.conn,
                 "SELECT do2.drv, o.id FROM DerivationOutputs do2 \
                  JOIN ValidPaths o ON o.path = do2.path",
+                &[],
             )?;
             // drv → output via ValidPaths.deriver
             add_edges(
@@ -215,16 +218,16 @@ impl NixDb {
                 "SELECT d.id, v.id FROM ValidPaths v \
                  JOIN ValidPaths d ON d.path = v.deriver \
                  WHERE v.deriver IS NOT NULL",
+                &[],
             )?;
             if has_build_trace {
                 // drv → output via BuildTraceV3
                 add_edges(
                     &self.conn,
-                    &format!(
-                        "SELECT d.id, o.id FROM BuildTraceV3 bt \
-                         JOIN ValidPaths d ON d.path = '{store_prefix}' || bt.drvPath \
-                         JOIN ValidPaths o ON o.path = bt.outputPath"
-                    ),
+                    "SELECT d.id, o.id FROM BuildTraceV3 bt \
+                     JOIN ValidPaths d ON d.path = ? || bt.drvPath \
+                     JOIN ValidPaths o ON o.path = bt.outputPath",
+                    &[&store_prefix],
                 )?;
             }
         }
