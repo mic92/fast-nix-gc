@@ -35,8 +35,6 @@ harmonia-utils-io            = { git = "https://github.com/nix-community/harmoni
 harmonia-utils-base-encoding = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 harmonia-store-path-info     = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
 
-[profile.release]
-
 [profile.profiling]
 inherits = "release"
 debug = true

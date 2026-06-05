@@ -5,6 +5,7 @@ use crate::gc_socket::{GcSocketServer, LiveSet};
 use crate::roots::{find_roots, find_temp_roots};
 use crate::{format_size, make_store_writable};
 use anyhow::{Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use rayon::prelude::*;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -67,24 +68,41 @@ fn delete_store_path(real_path: &Path) -> Result<u64> {
     Ok(bytes_freed)
 }
 
-use nix::fcntl::{Flock, FlockArg};
-
 /// Lock a `tmp-*` build dir before deleting. None means a builder still
 /// holds it. Caller keeps the fd through deletion to avoid a TOCTOU race.
 fn try_lock_dir(path: &Path) -> Option<Flock<fs::File>> {
-    let f = fs::File::open(path).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK: a stray FIFO named tmp-* must not block open() forever
+    // while we hold the exclusive gc.lock.
+    let f = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("cannot open {} for locking: {e}", path.display());
+            }
+            return None;
+        }
+    };
     Flock::lock(f, FlockArg::LockExclusiveNonblock).ok()
 }
 
 /// Same lock Nix takes. Builders hold it shared while registering temp
 /// roots; we take it exclusive so the root set can't change under us.
 fn acquire_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
     let lock_path = state_dir.join("gc.lock");
+    // 0600 like Nix's openLockFile: a world-readable lock would let any
+    // local user flock it and block GC and builders indefinitely.
     let f = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("opening GC lock {}", lock_path.display()))?;
 
@@ -114,33 +132,95 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     // Acquire the global GC lock before anything else. Builders take a
     // shared lock when adding temp roots; holding the exclusive lock
     // ensures no new roots appear after we scan them.
+    // Free the reserved space file first (Nix: deletePath(reservedPath)).
+    // On a 100% full disk the SQLite invalidation below needs room to
+    // write before any store path has been unlinked.
+    if !dry_run {
+        let reserved = db.state_dir.join("db/reserved");
+        match fs::remove_file(&reserved) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("cannot remove {}: {e}", reserved.display()),
+        }
+    }
+
     let _gc_lock = acquire_gc_lock(&db.state_dir)?;
 
     if !dry_run {
         make_store_writable(&db.real_store_dir)?;
     }
 
+    // Serve the gc-socket immediately after taking the lock, like Nix:
+    // builders that lost the shared-lock race retry connecting every
+    // 100ms, so the socket must exist before the (potentially long)
+    // graph load — and during dry runs, which hold the lock too.
+    //
+    // Phase 1: no graph yet, so every received root is acked instantly
+    // and recorded by basename. That is sound because nothing can be
+    // deleted before the graph exists; the roots are replayed below.
+    let store_prefix = format!("{}/", db.store_dir.display());
+    let early_live = Arc::new(LiveSet::new(0));
+    // A dry run on a read-only state dir can still report; without the
+    // socket no builder can run anyway (they need temproots).
+    let start_socket = |live: Arc<LiveSet>, graph: Arc<crate::db::StoreGraph>| -> Result<_> {
+        match GcSocketServer::start(&db.state_dir, live, graph) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if dry_run => {
+                log::warn!("cannot serve gc-socket: {e:#}");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    let early_socket = start_socket(
+        Arc::clone(&early_live),
+        Arc::new(crate::db::StoreGraph::empty(store_prefix.clone())),
+    )?;
+
+    // Test sync point: block until the named fifo is readable, so tests
+    // can deterministically exercise the early-socket window.
+    if let Ok(p) = std::env::var("_FAST_NIX_GC_TEST_SYNC_EARLY") {
+        let _ = fs::read(&p);
+    }
+
     log::info!("loading store graph...");
     let graph = Arc::new(db.load_graph()?);
     log::info!("{} total valid paths", graph.len());
 
-    // Start the gc-socket as soon as the graph is loaded so builders stop
-    // busy-polling gc.lock. Roots received only shrink the dead set.
-    let live = Arc::new(LiveSet::new(graph.len(), crate::HashSet::default()));
-    let _gc_socket = if dry_run {
-        None
-    } else {
-        Some(GcSocketServer::start(
-            &db.state_dir,
-            Arc::clone(&live),
-            Arc::clone(&graph),
-        )?)
-    };
+    // Phase 2: swap to the real server. Builders whose connection drops
+    // during the swap reconnect (Nix's addTempRoot restart loop).
+    drop(early_socket);
+    let early_roots = early_live.protected_unknown_snapshot();
+    let live = Arc::new(LiveSet::new(graph.len()));
+    let _gc_socket = start_socket(Arc::clone(&live), Arc::clone(&graph))?;
 
     let bidx = BasenameIndex::new(&graph);
 
+    // Replay phase-1 roots: known paths become ordinary GC roots (their
+    // closure stays alive), unknown basenames stay protected.
+    let mut early_root_idxs: Vec<u32> = Vec::new();
+    for b in &early_roots {
+        match bidx.idx_of_basename(b) {
+            Some(i) => early_root_idxs.push(i),
+            None => live.protect_unknown_basename(b),
+        }
+    }
+
+    // A --store-dir that doesn't match the DB contents (wrong directory)
+    // would make every root lookup miss and every DB path look dead,
+    // wiping the store. Refuse to proceed.
+    if !graph.is_empty() && bidx.map.is_empty() {
+        anyhow::bail!(
+            "store dir {} does not match any path in the Nix database \
+             (e.g. {}); refusing to collect garbage",
+            db.store_dir.display(),
+            graph.paths[0],
+        );
+    }
+
     log::info!("finding garbage collector roots...");
-    let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx);
+    let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx)?;
+    roots.extend(early_root_idxs);
 
     // Add temp roots. Some may reference paths registered after our
     // graph snapshot (a builder can register paths while we hold
@@ -148,11 +228,22 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     // Track those by basename so the unknown-on-disk scan won't
     // delete them.
     let mut temp_root_basenames: crate::HashSet<String> = crate::HashSet::default();
+    // Hash parts of all temp roots. Nix matches temp roots by hash part so
+    // that sibling files of an active build (`<path>.lock`, `<path>.chroot`,
+    // `<path>.check`) are protected too; the unknown-on-disk scan must not
+    // delete a lock file another builder currently holds.
+    let mut temp_root_hashes: crate::HashSet<String> = crate::HashSet::default();
     for tr in find_temp_roots(&db.state_dir)? {
+        if let Some(b) = tr.strip_prefix(graph.store_prefix.as_str()) {
+            if b.len() > 32 && b.as_bytes()[32] == b'-' {
+                temp_root_hashes.insert(b[..32].to_owned());
+            }
+            if bidx.idx_of_basename(b).is_none() {
+                temp_root_basenames.insert(b.to_owned());
+            }
+        }
         if let Some(i) = bidx.idx_of(&tr) {
             roots.push(i);
-        } else if let Some(b) = tr.strip_prefix(graph.store_prefix.as_str()) {
-            temp_root_basenames.insert(b.to_owned());
         }
     }
     // --keep-recent: treat recently registered paths as roots.
@@ -180,20 +271,31 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     // Also find entries on disk that aren't in the DB at all.
     // Compare by basename to avoid allocating a full-path string per entry.
     let store_prefix = graph.store_prefix.clone();
-    let mut unknown_on_disk: Vec<String> = Vec::new();
+    // Raw OsString names: a non-UTF-8 entry can't be in the DB (it stores
+    // text), but it is still garbage that must be unlinked by its real
+    // bytes — a lossy name would aim remove_file at a nonexistent path.
+    let mut unknown_on_disk: Vec<std::ffi::OsString> = Vec::new();
     if let Ok(entries) = fs::read_dir(&db.real_store_dir) {
         for entry in entries.flatten() {
             let raw = entry.file_name();
-            let name = raw.to_string_lossy();
             // read_dir never yields "." or "..".
-            if name == ".links" {
-                continue;
+            if let Some(name) = raw.to_str() {
+                if name == ".links" {
+                    continue;
+                }
+                // An entry shares an active build's hash part if its first
+                // 32 chars match (covers `<path>.lock` and friends).
+                let hash_part_active = name.len() >= 32
+                    && name.is_char_boundary(32)
+                    && temp_root_hashes.contains(&name[..32]);
+                if bidx.idx_of_basename(name).is_some()
+                    || temp_root_basenames.contains(name)
+                    || hash_part_active
+                {
+                    continue;
+                }
             }
-            if bidx.idx_of_basename(name.as_ref()).is_none()
-                && !temp_root_basenames.contains(name.as_ref())
-            {
-                unknown_on_disk.push(name.into_owned());
-            }
+            unknown_on_disk.push(raw);
         }
     }
     if !unknown_on_disk.is_empty() {
@@ -211,16 +313,26 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
         let mut estimated = 0u64;
         let mut count = 0usize;
+        // Roots can arrive over the gc-socket while we run; a real GC
+        // would honor them, so the report must too.
+        let protected = live.protected_snapshot();
+        let protected_unknown = live.protected_unknown_snapshot();
         for &node in &dead_indices {
             if estimated >= max {
                 break;
+            }
+            if protected[node as usize] {
+                continue;
             }
             writeln!(stdout, "{}", graph.paths[node as usize])?;
             estimated += graph.nar_sizes[node as usize];
             count += 1;
         }
         for name in &unknown_on_disk {
-            writeln!(stdout, "{store_prefix}{name}")?;
+            if name.to_str().is_some_and(|n| protected_unknown.contains(n)) {
+                continue;
+            }
+            writeln!(stdout, "{store_prefix}{}", name.display())?;
             count += 1;
         }
         return Ok((estimated, count));
@@ -297,42 +409,46 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
                 i += 1;
             }
         }
-        // Snapshot-filter, don't pre-claim: protect() should wait for the
-        // rayon-bounded in-flight set, not the whole chunk.
-        let (mut claimed, skipped): (Vec<u32>, Vec<u32>) =
-            chunk.iter().copied().partition(|&n| !live.is_protected(n));
-        // protect() marks closures atomically, but this filter reads one
-        // node at a time: it may have kept a reference whose referrer got
-        // protected a moment later. Drop the closures of skipped paths.
+        // Claim (mark pending) atomically with the protection check,
+        // *before* invalidating DB rows. A protect() arriving later for a
+        // claimed node blocks until the unlink finished, so a builder is
+        // never acked while the row deletion is still in flight — it sees
+        // a consistent "gone" state and re-registers.
+        let (mut claimed, skipped) = live.claim_nodes(&chunk);
+        // protect() marks closures atomically, but the claim is per node:
+        // it may have kept a reference whose referrer got protected a
+        // moment earlier. Drop the closures of skipped paths.
         if !skipped.is_empty() {
             let keep_out = graph.compute_closure(&skipped);
-            claimed.retain(|&n| !keep_out[n as usize]);
+            claimed.retain(|&n| {
+                if keep_out[n as usize] {
+                    live.end_delete_node(n);
+                    false
+                } else {
+                    true
+                }
+            });
         }
         // Invalidate rows before unlinking: builders trust isValidPath(),
         // so a path must never look valid after its disk entry is gone.
-        // Paths protected after this point stay on disk; their builder
-        // re-registers them or the next run collects them as
-        // unknown-on-disk. See alloy/gc_db_consistency.als.
+        // See alloy/gc_db_consistency.als.
         db.invalidate_paths(claimed.iter().map(|&n| graph.paths[n as usize].as_str()))?;
-        let n_deleted = claimed
-            .par_iter()
-            .copied()
-            .filter(|&node| {
-                if !live.try_begin_delete_node(node) {
-                    return false;
-                }
-                let path = &graph.paths[node as usize];
-                let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
-                let real_path = real_store_dir.join(basename);
-                log::debug!("deleting '{path}'");
-                if let Ok(freed) = delete_store_path(&real_path) {
+        claimed.par_iter().for_each(|&node| {
+            let path = &graph.paths[node as usize];
+            let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
+            let real_path = real_store_dir.join(basename);
+            log::debug!("deleting '{path}'");
+            match delete_store_path(&real_path) {
+                Ok(freed) => {
                     bytes_freed.fetch_add(freed, Ordering::Relaxed);
                 }
-                live.end_delete_node(node);
-                true
-            })
-            .count();
-        paths_deleted.fetch_add(n_deleted as u64, Ordering::Relaxed);
+                // Row already invalidated; the leftover is picked up as
+                // unknown-on-disk by the next run.
+                Err(e) => log::warn!("failed to delete {}: {e:#}", real_path.display()),
+            }
+            live.end_delete_node(node);
+        });
+        paths_deleted.fetch_add(claimed.len() as u64, Ordering::Relaxed);
     }
 
     // Unknown-on-disk paths: also parallel. tmp-* dirs hold flock through
@@ -346,26 +462,33 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         // shielded by protected_unknown. See tempRootStale in
         // alloy/gc_db_consistency.als.
         let mut unknown_on_disk = unknown_on_disk;
-        unknown_on_disk.retain(
-            |name| match db.is_valid_path(&format!("{store_prefix}{name}")) {
+        unknown_on_disk.retain(|name| {
+            // A non-UTF-8 name can't be a DB path (the DB stores text).
+            let Some(name) = name.to_str() else {
+                return true;
+            };
+            match db.is_valid_path(&format!("{store_prefix}{name}")) {
                 Ok(valid) => !valid,
                 Err(e) => {
                     log::warn!("skipping {store_prefix}{name}: validity check failed: {e}");
                     false
                 }
-            },
-        );
-        unknown_on_disk.par_iter().for_each(|name| {
-            if !live.try_begin_delete_unknown(name) {
+            }
+        });
+        unknown_on_disk.par_iter().for_each(|raw| {
+            // The liveset/protocol key is textual; non-UTF-8 names can't
+            // collide with anything a builder protects.
+            let name = raw.to_string_lossy();
+            if !live.try_begin_delete_unknown(&name) {
                 return;
             }
-            let real_path = real_store_dir.join(name);
+            let real_path = real_store_dir.join(raw);
             let _tmp_lock = if name.starts_with("tmp-") {
                 match try_lock_dir(&real_path) {
                     Some(f) => Some(f),
                     None => {
                         log::debug!("skipping locked tempdir {}", real_path.display());
-                        live.end_delete_unknown(name);
+                        live.end_delete_unknown(&name);
                         return;
                     }
                 }
@@ -373,11 +496,14 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
                 None
             };
             log::debug!("deleting '{store_prefix}{name}'");
-            if let Ok(freed) = delete_store_path(&real_path) {
-                bytes_freed.fetch_add(freed, Ordering::Relaxed);
+            match delete_store_path(&real_path) {
+                Ok(freed) => {
+                    bytes_freed.fetch_add(freed, Ordering::Relaxed);
+                    paths_deleted.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => log::warn!("failed to delete {}: {e:#}", real_path.display()),
             }
-            live.end_delete_unknown(name);
-            paths_deleted.fetch_add(1, Ordering::Relaxed);
+            live.end_delete_unknown(&name);
         });
     }
 
@@ -385,53 +511,56 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     let paths_deleted = paths_deleted.into_inner() as usize;
 
     // Clean up unused hard links in .links
-    if !dry_run {
-        clean_links(&db.links_dir)?;
-    }
+    let bytes_freed = bytes_freed + clean_links(&db.links_dir)?;
 
     Ok((bytes_freed, paths_deleted))
 }
 
-/// Remove hard links with link count 1 from .links directory.
-/// The .links dir can contain millions of entries; stat + unlink per entry
-/// is disk-bound, so process in parallel.
-fn clean_links(links_dir: &Path) -> Result<()> {
-    use std::sync::atomic::AtomicI64;
-
+/// Remove hard links with link count 1 from .links directory, returning
+/// bytes freed. The .links dir can contain millions of entries; stat +
+/// unlink per entry is disk-bound, so process in parallel. Stream the
+/// entries instead of collecting them: a Vec of millions of DirEntries
+/// costs gigabytes of RSS.
+fn clean_links(links_dir: &Path) -> Result<u64> {
     log::info!("deleting unused links...");
-    let entries: Vec<_> = match fs::read_dir(links_dir) {
-        Ok(e) => e.flatten().collect(),
-        Err(_) => return Ok(()),
+    let entries = match fs::read_dir(links_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            log::warn!("cannot read {}: {e}", links_dir.display());
+            return Ok(0);
+        }
     };
 
-    // For each surviving link with N references, hard linking saves
-    // (N-1)*size bytes compared to N independent copies.
-    let saved_bytes = AtomicI64::new(0);
+    // A link entry has one reference from .links plus one per store file.
+    // N references total mean hard linking saves (N-2)*size compared to
+    // independent copies.
+    let saved_bytes = AtomicU64::new(0);
+    let freed_bytes = AtomicU64::new(0);
 
-    entries.par_iter().for_each(|entry| {
+    entries.flatten().par_bridge().for_each(|entry| {
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             return;
         };
         if meta.nlink() != 1 {
             saved_bytes.fetch_add(
-                (meta.nlink() as i64 - 1) * meta.size() as i64,
+                meta.nlink().saturating_sub(2) * meta.size(),
                 Ordering::Relaxed,
             );
             return;
         }
-        fs::remove_file(&path).ok();
+        if fs::remove_file(&path).is_ok() {
+            freed_bytes.fetch_add(meta.blocks() * 512, Ordering::Relaxed);
+        }
     });
 
     let saving = saved_bytes.into_inner();
     if saving > 0 {
-        log::info!(
-            "hard linking is currently saving {}",
-            format_size(saving as u64)
-        );
+        log::info!("hard linking is currently saving {}", format_size(saving));
     }
 
-    Ok(())
+    Ok(freed_bytes.into_inner())
 }
 
 #[cfg(test)]
@@ -503,11 +632,13 @@ mod tests {
         fs::write(&shared, b"referenced").unwrap();
         fs::hard_link(&shared, tmp.path().join("user")).unwrap();
 
-        clean_links(&links).unwrap();
+        let dead_blocks = fs::symlink_metadata(&dead).unwrap().blocks() * 512;
+        let freed = clean_links(&links).unwrap();
 
         assert!(!dead.exists());
         assert!(shared.exists());
+        assert_eq!(freed, dead_blocks, "freed bytes of removed links");
         // Missing .links dir is not an error.
-        clean_links(&tmp.path().join("nope")).unwrap();
+        assert_eq!(clean_links(&tmp.path().join("nope")).unwrap(), 0);
     }
 }

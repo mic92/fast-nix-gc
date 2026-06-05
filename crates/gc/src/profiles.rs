@@ -9,19 +9,27 @@ use std::time::{Duration, SystemTime};
 
 /// Parse Nix-style time specs like "30d", "4h", "2w", "1m".
 pub fn parse_older_than(spec: &str) -> Result<SystemTime> {
-    if spec.len() < 2 {
+    // Take the last *character*; a byte-based split_at would panic on
+    // multi-byte input like "30日".
+    let Some((idx, unit)) = spec.char_indices().last() else {
+        bail!("invalid time spec '{}', expected e.g. '30d'", spec);
+    };
+    let num_str = &spec[..idx];
+    if num_str.is_empty() {
         bail!("invalid time spec '{}', expected e.g. '30d'", spec);
     }
-    // split_at must land on a char boundary; suffix is always ASCII.
-    let (num_str, unit) = spec.split_at(spec.len() - 1);
     let num: u64 = num_str.parse().context("invalid number in time spec")?;
-    let secs = match unit {
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 7 * 86400,
-        "m" => num * 30 * 86400,
+    let unit_secs = match unit {
+        'h' => 3600,
+        'd' => 86400,
+        'w' => 7 * 86400,
+        'm' => 30 * 86400,
         _ => bail!("unknown time unit '{}', use h/d/w/m", unit),
     };
+    let secs = num
+        .checked_mul(unit_secs)
+        .filter(|&s| s <= i64::MAX as u64)
+        .with_context(|| format!("time spec '{spec}' is out of range"))?;
     Ok(SystemTime::now() - Duration::from_secs(secs))
 }
 
@@ -55,7 +63,8 @@ fn find_generation_links(profile: &Path) -> Result<Vec<(PathBuf, u64)>> {
 fn current_generation(profile: &Path) -> Result<Option<u64>> {
     let target = match fs::read_link(profile) {
         Ok(t) => t,
-        Err(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("readlink {}", profile.display())),
     };
     let name = target
         .file_name()
@@ -77,12 +86,77 @@ fn current_generation(profile: &Path) -> Result<Option<u64>> {
     Ok(None)
 }
 
+/// Lock held while mutating a profile's generations, interoperable with
+/// Nix's PathLocks protocol (pathlocks.cc): flock(2) on "<profile>.lock",
+/// stale detection via a non-empty file, deletion marker on release.
+struct ProfileLock {
+    lock_path: PathBuf,
+    file: fs::File,
+}
+
+impl ProfileLock {
+    fn acquire(profile: &Path) -> Result<ProfileLock> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut name = profile.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        let lock_path = profile.with_file_name(name);
+        loop {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)
+                .with_context(|| format!("opening {}", lock_path.display()))?;
+            loop {
+                if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(nix::libc::EINTR) {
+                    return Err(err).with_context(|| format!("locking {}", lock_path.display()));
+                }
+            }
+            // Stale check (Nix protocol): a non-empty lock file was marked
+            // and unlinked by its previous holder; retry on a fresh inode.
+            if file.metadata()?.len() != 0 {
+                continue;
+            }
+            return Ok(ProfileLock { lock_path, file });
+        }
+    }
+}
+
+impl Drop for ProfileLock {
+    fn drop(&mut self) {
+        use std::io::Write;
+        // Nix's deleteLockFile: write the deletion marker, then unlink.
+        // The flock itself is released when the fd closes.
+        let _ = self.file.write_all(b"d");
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
 fn delete_old_generations(profile: &Path, dry_run: bool) -> Result<()> {
-    let current = current_generation(profile)?;
+    // Serialize against nix-env/nixos-rebuild generation switches, which
+    // take the same lock (profiles.cc lockProfile).
+    let _lock = ProfileLock::acquire(profile)?;
+    // Fail closed: if we cannot tell which generation is active (profile
+    // gone or pointing at something that isn't a generation link),
+    // deleting "all but current" would delete the active system too.
+    let Some(current) = current_generation(profile)? else {
+        log::warn!(
+            "cannot determine current generation of {}; skipping",
+            profile.display()
+        );
+        return Ok(());
+    };
     let gens = find_generation_links(profile)?;
 
     for (path, r#gen) in &gens {
-        if Some(*r#gen) == current {
+        if *r#gen == current {
             continue;
         }
         if dry_run {
@@ -96,18 +170,39 @@ fn delete_old_generations(profile: &Path, dry_run: bool) -> Result<()> {
 }
 
 fn delete_generations_older_than(profile: &Path, cutoff: SystemTime, dry_run: bool) -> Result<()> {
-    let current = current_generation(profile)?;
+    let _lock = ProfileLock::acquire(profile)?;
+    // Same fail-closed rule as delete_old_generations.
+    let Some(current) = current_generation(profile)? else {
+        log::warn!(
+            "cannot determine current generation of {}; skipping",
+            profile.display()
+        );
+        return Ok(());
+    };
     let gens = find_generation_links(profile)?;
 
+    let mtime_of = |path: &Path| -> Option<SystemTime> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        Some(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+    };
+
+    // Like Nix (profiles.cc deleteGenerationsOlderThan): keep the newest
+    // generation older than the cutoff. It was the active one at the
+    // requested point in time, and the user wants to be able to roll back
+    // to it.
+    let newest_older = gens
+        .iter()
+        .rev()
+        .find(|(path, _)| mtime_of(path).is_some_and(|t| t < cutoff))
+        .map(|(_, g)| *g);
+
     for (path, r#gen) in &gens {
-        if Some(*r#gen) == current {
+        if *r#gen == current || Some(*r#gen) == newest_older {
             continue;
         }
-        let meta = match fs::symlink_metadata(path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Some(mtime) = mtime_of(path) else {
+            continue;
         };
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if mtime < cutoff {
             if dry_run {
                 log::info!("would remove (old): {}", path.display());
@@ -161,20 +256,27 @@ pub fn remove_old_generations(
     Ok(())
 }
 
+/// Directories scanned for profiles, mirroring nix-collect-garbage:
+/// the system profiles dir (recursed, so per-user is covered) and the
+/// invoking user's XDG state profiles dir. Never the home directory
+/// itself — remove_old_generations recurses, and treating arbitrary
+/// `*-N-link` symlinks under $HOME as generations would delete user data.
 pub fn profile_dirs(state_dir: &Path) -> BTreeSet<PathBuf> {
     let mut dirs = BTreeSet::new();
 
-    if let Ok(user) = std::env::var("USER") {
-        dirs.insert(state_dir.join("profiles/per-user").join(&user));
-    }
-
     dirs.insert(state_dir.join("profiles"));
 
-    if let Ok(home) = std::env::var("HOME") {
-        let default_profile = PathBuf::from(&home).join(".nix-profile");
-        if let Some(parent) = default_profile.parent() {
-            dirs.insert(parent.to_path_buf());
-        }
+    let xdg_state = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        });
+    if let Some(state_home) = xdg_state {
+        dirs.insert(state_home.join("nix/profiles"));
     }
 
     dirs
@@ -210,6 +312,12 @@ mod tests {
         assert!(parse_older_than("d").is_err());
         assert!(parse_older_than("5x").is_err());
         assert!(parse_older_than("xd").is_err());
+        // Multi-byte unit must error, not panic on a char boundary.
+        assert!(parse_older_than("30日").is_err());
+        assert!(parse_older_than("日").is_err());
+        // Overflowing multiplication must error, not wrap.
+        assert!(parse_older_than("99999999999999999999d").is_err());
+        assert!(parse_older_than("9999999999999999999d").is_err());
     }
 
     #[test]
@@ -296,15 +404,23 @@ mod tests {
             );
         }
 
-        // Cutoff exactly at gen 2's mtime: only gen 1 (strictly older) goes.
-        // Gen 4 is current and always kept.
+        // Cutoff exactly at gen 2's mtime: gen 1 is the only strictly
+        // older generation, and as the one active at the cutoff it is
+        // kept for rollback (Nix semantics). Nothing goes.
         let cutoff = base + Duration::from_secs(200);
         delete_generations_older_than(&profile, cutoff, true).unwrap();
         assert_eq!(existing_gens(dir.path()), vec![1, 2, 3, 4]);
         delete_generations_older_than(&profile, cutoff, false).unwrap();
-        assert_eq!(existing_gens(dir.path()), vec![2, 3, 4]);
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3, 4]);
 
-        // Cutoff after all gens: everything but current goes.
+        // Cutoff between gen 3 and 4: gens 1-3 are older, gen 3 was
+        // active at the cutoff and is kept; 1 and 2 go.
+        let cutoff = base + Duration::from_secs(350);
+        delete_generations_older_than(&profile, cutoff, false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![3, 4]);
+
+        // Cutoff after all gens: the newest older one is the current
+        // generation itself, so everything else goes.
         delete_generations_older_than(&profile, base + Duration::from_secs(10_000), false).unwrap();
         assert_eq!(existing_gens(dir.path()), vec![4]);
     }
@@ -337,16 +453,46 @@ mod tests {
     }
 
     #[test]
-    fn profile_dirs_includes_state_and_user_paths() {
+    fn profile_dirs_includes_state_and_xdg_paths_but_not_home() {
         let state = Path::new("/var/state");
         let dirs = profile_dirs(state);
         assert!(dirs.contains(&state.join("profiles")));
-        if let Ok(user) = std::env::var("USER") {
-            assert!(dirs.contains(&state.join("profiles/per-user").join(user)));
-        }
         if let Ok(home) = std::env::var("HOME") {
-            assert!(dirs.contains(&PathBuf::from(home)));
+            // $HOME itself must never be scanned recursively.
+            assert!(!dirs.contains(&PathBuf::from(&home)));
+            if std::env::var("XDG_STATE_HOME").is_err() {
+                assert!(dirs.contains(&PathBuf::from(home).join(".local/state/nix/profiles")));
+            }
         }
+    }
+
+    #[test]
+    fn profile_lock_acquire_release_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("system");
+        let lock_path = dir.path().join("system.lock");
+        {
+            let _lock = ProfileLock::acquire(&profile).unwrap();
+            assert!(lock_path.exists());
+        }
+        // Released locks are unlinked (Nix deleteLockFile protocol).
+        assert!(!lock_path.exists());
+        let _lock = ProfileLock::acquire(&profile).unwrap();
+    }
+
+    #[test]
+    fn unparseable_current_generation_deletes_nothing() {
+        // Profile pointing at a non-generation target: refusing to guess
+        // protects the active generation from "delete all but current".
+        let (dir, profile) = setup_profile(3, 2);
+        fs::remove_file(&profile).unwrap();
+        symlink("/nix/store/custom-env", &profile).unwrap();
+
+        delete_old_generations(&profile, false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3]);
+
+        delete_generations_older_than(&profile, SystemTime::now(), false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3]);
     }
 
     #[test]

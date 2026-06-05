@@ -3,18 +3,21 @@
 
 use crate::HashSet;
 use crate::db::BasenameIndex;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
 /// Find all GC root node indices by walking gcroots/profiles directories
 /// and scanning running processes.
-pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Vec<u32> {
+pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Result<Vec<u32>> {
     let mut roots = HashSet::default();
     let store_prefix = store_dir.to_string_lossy().to_string();
 
+    // Errors here must abort the GC: silently dropping a roots directory
+    // (e.g. EACCES) would let the GC delete live paths.
     for dir in [state_dir.join("gcroots"), state_dir.join("profiles")] {
-        find_roots_in_dir(&dir, &store_prefix, idx, &mut roots);
+        find_roots_in_dir(&dir, &store_prefix, idx, &mut roots)
+            .with_context(|| format!("scanning roots in {}", dir.display()))?;
     }
 
     // Also scan running processes for runtime roots.
@@ -46,7 +49,7 @@ pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Ve
         }
     }
 
-    roots.into_iter().collect()
+    Ok(roots.into_iter().collect())
 }
 
 fn find_roots_in_dir(
@@ -54,23 +57,31 @@ fn find_roots_in_dir(
     store_prefix: &str,
     idx: &BasenameIndex,
     roots: &mut HashSet<u32>,
-) {
+) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        // A missing roots dir contributes no roots; anything else (EACCES,
+        // EIO) hides an unknown number of roots and must fail the GC.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            // Entry removed while scanning (e.g. a stale auto link another
+            // process cleaned up) — not a root anymore.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
         };
 
         if meta.file_type().is_symlink() {
             let target = match fs::read_link(&path) {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("readlink {}", path.display())),
             };
             let target_str = target.to_string_lossy();
 
@@ -92,9 +103,18 @@ fn find_roots_in_dir(
                 };
                 // metadata() (stat, follows) returns ENOENT for dangling
                 // links and ELOOP for cycles — both are "target gone".
-                if fs::metadata(&abs_target).is_err() {
-                    let auto_dir = dir.to_string_lossy();
-                    if auto_dir.contains("gcroots/auto") {
+                // Any other error (EACCES, EIO) says nothing about the
+                // target's existence: removing the root then would let the
+                // GC delete a live path.
+                if let Err(e) = fs::metadata(&abs_target) {
+                    let target_gone = e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32);
+                    if !target_gone {
+                        return Err(e).with_context(|| format!("stat {}", abs_target.display()));
+                    }
+                    // Component match, not substring: "gcroots/automatic"
+                    // must not qualify.
+                    if dir.ends_with("gcroots/auto") {
                         log::info!("removing stale link {}", path.display());
                         fs::remove_file(&path).ok();
                     }
@@ -116,7 +136,7 @@ fn find_roots_in_dir(
                 }
             }
         } else if meta.file_type().is_dir() {
-            find_roots_in_dir(&path, store_prefix, idx, roots);
+            find_roots_in_dir(&path, store_prefix, idx, roots)?;
         } else if meta.file_type().is_file() {
             // Regular file root (e.g. in auto-roots)
             let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -126,6 +146,7 @@ fn find_roots_in_dir(
             }
         }
     }
+    Ok(())
 }
 
 /// Extract the top-level store path from a potentially deeper path.
@@ -322,7 +343,9 @@ mod runtime_roots {
     const PROC_PIDLISTFDS: c_int = 1;
     const PROC_PIDVNODEPATHINFO: c_int = 9;
     const PROC_PIDREGIONPATHINFO: c_int = 8;
-    const PROC_PIDFDVNODEPATHINFO: c_int = 1;
+    // proc_info.h: PROC_PIDFDVNODEINFO is 1 and carries no path;
+    // PATHINFO is 2.
+    const PROC_PIDFDVNODEPATHINFO: c_int = 2;
     const PROX_FDTYPE_VNODE: u32 = 1;
     const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
     const MAXPATHLEN: usize = 1024;
@@ -640,21 +663,30 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
         let path = entry.path();
         let f = match fs::OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
-            Err(_) => continue,
+            // Owner exited and the file was cleaned up meanwhile.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Anything else (EACCES, EIO) hides live roots: deleting their
+            // targets would yank paths from under a running builder.
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
         };
 
         // Owner holds a write lock while alive; if we can take it, it's stale.
-        if let Ok(_lock) = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        if let Ok(mut lock) =
+            nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        {
             log::info!("removing stale temporary roots file {}", path.display());
             fs::remove_file(&path).ok();
-            // _lock dropped here, releasing flock after unlink
+            // Nix protocol (gc.cc): write "d" after unlinking so a client
+            // that re-acquires its fd sees the marker and recreates the
+            // file instead of writing roots into an unlinked inode the GC
+            // will never read.
+            use std::io::Write;
+            let _ = lock.write_all(b"d");
+            // lock dropped here, releasing flock after unlink
             continue;
         }
 
-        let contents = match fs::read(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let contents = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
 
         // Each path is NUL-terminated. A trailing run without a NUL is a
         // partial write from a live builder — drop it.
@@ -769,11 +801,23 @@ mod tests {
         fs::write(dir.join(".keep"), b"junk").unwrap();
         fs::write(dir.join("notapid"), format!("/nix/store/{HASH}-junk\0")).unwrap();
 
+        // Keep an fd on the stale file to observe the "d" marker.
+        let stale_fd = fs::File::open(&stale).unwrap();
+
         let roots = find_temp_roots(tmp.path()).unwrap();
         assert!(roots.contains(&sp1));
         assert!(roots.contains(&sp2));
         assert_eq!(roots.len(), 2, "{roots:?}");
         assert!(!stale.exists(), "stale temp roots file removed");
+        // Nix clients detect deletion by reading back a "d" marker.
+        {
+            use std::io::{Read, Seek};
+            let mut f = stale_fd;
+            f.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"d", "missing deletion marker");
+        }
         assert!(dir.join(".keep").exists());
         assert!(dir.join("notapid").exists());
     }

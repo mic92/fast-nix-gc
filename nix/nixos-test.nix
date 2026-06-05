@@ -42,7 +42,7 @@ pkgs.testers.runNixOSTest {
     # Build a CA derivation directly in the system store.
     ca_drv_expr = (
         'derivation { '
-        'name = "ca-test"; system = "${pkgs.system}"; '
+        'name = "ca-test"; system = "${pkgs.stdenv.hostPlatform.system}"; '
         'builder = "/bin/sh"; args = ["-c" "echo hello > $out"]; '
         '__contentAddressed = true; outputHashMode = "recursive"; '
         'outputHashAlgo = "sha256"; }'
@@ -99,7 +99,7 @@ pkgs.testers.runNixOSTest {
         "cat > /tmp/ca-test2.nix <<'EOF'\n"
         "derivation {\n"
         '  name = "ca-test2";\n'
-        '  system = "${pkgs.system}";\n'
+        '  system = "${pkgs.stdenv.hostPlatform.system}";\n'
         '  builder = "/bin/sh";\n'
         '  args = ["-c" "echo hello2 > $out"];\n'
         "  __contentAddressed = true;\n"

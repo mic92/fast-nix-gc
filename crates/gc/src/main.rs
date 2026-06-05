@@ -27,6 +27,9 @@ fn parse_size(s: &str) -> Result<u64> {
         _ => (s, 1),
     };
     let n: f64 = num.parse().with_context(|| format!("invalid size '{s}'"))?;
+    if !n.is_finite() || n < 0.0 || n * mult as f64 > u64::MAX as f64 {
+        bail!("size '{s}' is out of range");
+    }
     Ok((n * mult as f64) as u64)
 }
 
@@ -39,21 +42,25 @@ fn available_bytes(path: &Path) -> Result<u64> {
 }
 
 fn parse_args() -> Result<Args> {
-    let mut pargs = pico_args::Arguments::from_env();
+    parse_args_from(std::env::args_os().skip(1).collect())
+}
+
+fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
+    let mut pargs = pico_args::Arguments::from_vec(args);
 
     if pargs.contains("--help") {
-        eprintln!("Usage: fast-nix-gc [OPTIONS]");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  -d, --delete-old             Remove old profile generations");
-        eprintln!("      --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d)");
-        eprintln!("      --dry-run                 Show what would be done");
-        eprintln!("      --ensure-free SIZE           Free until SIZE is available (e.g. 50G)");
-        eprintln!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
-        eprintln!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
-        eprintln!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
-        eprintln!("      --store-dir PATH          Nix store directory [default: /nix/store]");
-        eprintln!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
+        println!("Usage: fast-nix-gc [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("  -d, --delete-old              Remove old profile generations");
+        println!("      --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d)");
+        println!("      --dry-run                 Show what would be done");
+        println!("      --ensure-free SIZE        Free until SIZE is available (e.g. 50G)");
+        println!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
+        println!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
+        println!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
+        println!("      --store-dir PATH          Nix store directory [default: /nix/store]");
+        println!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
         std::process::exit(0);
     }
 
@@ -61,7 +68,7 @@ fn parse_args() -> Result<Args> {
     let delete_old =
         pargs.contains("-d") || pargs.contains("--delete-old") || delete_older_than.is_some();
 
-    Ok(Args {
+    let args = Args {
         delete_old,
         delete_older_than,
         dry_run: pargs.contains("--dry-run"),
@@ -75,32 +82,17 @@ fn parse_args() -> Result<Args> {
         state_dir: pargs
             .opt_value_from_str("--state-dir")?
             .unwrap_or_else(|| PathBuf::from("/nix/var/nix")),
-    })
-}
-
-/// Minimal stderr logger: `[LEVEL] message`. Level controlled by
-/// RUST_LOG=error|warn|info|debug|trace (default: info).
-struct StderrLogger(log::LevelFilter);
-
-impl log::Log for StderrLogger {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= self.0
+    };
+    // A typo'd flag (e.g. --dry-rnu) must not silently run a destructive GC.
+    let rest = pargs.finish();
+    if !rest.is_empty() {
+        bail!("unexpected arguments: {rest:?}");
     }
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!("[{:5}] {}", record.level(), record.args());
-        }
-    }
-    fn flush(&self) {}
+    Ok(args)
 }
 
 fn main() -> Result<()> {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(log::LevelFilter::Info);
-    log::set_boxed_logger(Box::new(StderrLogger(level))).unwrap();
-    log::set_max_level(level);
+    fast_nix_common::logging::init();
 
     let args = parse_args()?;
 
@@ -111,6 +103,32 @@ fn main() -> Result<()> {
 
     if args.ensure_free.is_some() && args.dry_run {
         bail!("--ensure-free cannot be combined with --dry-run");
+    }
+
+    // Validate every time spec before any destructive work; a bad
+    // --keep-recent must not surface only after generations were deleted.
+    let delete_older_cutoff = args
+        .delete_older_than
+        .as_deref()
+        .map(profiles::parse_older_than)
+        .transpose()?;
+    let keep_recent_after = args
+        .keep_recent
+        .as_deref()
+        .map(profiles::parse_older_than)
+        .transpose()?
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
+
+    if args.delete_old {
+        profiles::profile_dirs(&args.state_dir)
+            .par_iter()
+            .try_for_each(|dir| {
+                profiles::remove_old_generations(dir, delete_older_cutoff, args.dry_run)
+            })?;
     }
 
     let max_freed = if let Some(target) = args.ensure_free {
@@ -130,30 +148,17 @@ fn main() -> Result<()> {
         None
     };
 
-    if args.delete_old {
-        let cutoff = args
-            .delete_older_than
-            .as_deref()
-            .map(profiles::parse_older_than)
-            .transpose()?;
-
-        profiles::profile_dirs(&args.state_dir)
-            .par_iter()
-            .try_for_each(|dir| profiles::remove_old_generations(dir, cutoff, args.dry_run))?;
-    }
-
-    let keep_recent_after = args
-        .keep_recent
-        .as_deref()
-        .map(profiles::parse_older_than)
-        .transpose()?
-        .map(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        });
-
-    let mut store = db::NixDb::open(&args.store_dir, &args.state_dir)?;
+    let mut store = if args.dry_run {
+        // No DB writes happen in a dry run; don't take write locks or
+        // flip the journal mode. A WAL database without its -shm/-wal
+        // sidecars can't be opened read-only, so fall back to read-write.
+        db::NixDb::open_read_only(&args.store_dir, &args.state_dir).or_else(|e| {
+            log::debug!("read-only open failed ({e:#}); retrying read-write");
+            db::NixDb::open(&args.store_dir, &args.state_dir)
+        })?
+    } else {
+        db::NixDb::open(&args.store_dir, &args.state_dir)?
+    };
     if let Some(v) = args.keep_outputs {
         store.keep_outputs = v;
     }
@@ -184,7 +189,19 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::{parse_args_from, parse_size};
+
+    fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
+        list.iter().map(|s| s.into()).collect()
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_arguments() {
+        assert!(parse_args_from(args(&["--dry-rnu"])).is_err());
+        assert!(parse_args_from(args(&["--dry-run", "extra"])).is_err());
+        let parsed = parse_args_from(args(&["--dry-run"])).unwrap();
+        assert!(parsed.dry_run);
+    }
 
     #[test]
     fn parse_size_units() {
@@ -200,5 +217,9 @@ mod tests {
         assert_eq!(parse_size("1.5K").unwrap(), 1536);
         assert_eq!(parse_size(" 4M ").unwrap(), 4 * 1024 * 1024);
         assert!(parse_size("abc").is_err());
+        assert!(parse_size("-5G").is_err());
+        assert!(parse_size("inf").is_err());
+        assert!(parse_size("NaN").is_err());
+        assert!(parse_size("99999999999999999999G").is_err());
     }
 }

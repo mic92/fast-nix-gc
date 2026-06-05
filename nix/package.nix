@@ -2,7 +2,6 @@
   lib,
   rustPlatform,
   pkg-config,
-  nix,
   sqlite,
 }:
 let
@@ -28,10 +27,7 @@ rustPlatform.buildRustPackage {
     };
   };
   nativeBuildInputs = [ pkg-config ];
-  buildInputs = [
-    nix
-    sqlite
-  ];
+  buildInputs = [ sqlite ];
   cargoBuildFlags = [
     "-p"
     "fast-nix-gc"

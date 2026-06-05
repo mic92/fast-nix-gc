@@ -6,7 +6,6 @@ use fast_nix_common::{
     HashSet, db::NixDb, format_size, make_store_writable, unshare_mount_namespace,
 };
 use harmonia_store_core::store_path::StoreDir;
-use nix::fcntl::{Flock, FlockArg};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -22,6 +21,12 @@ pub struct Stats {
     pub bytes_freed: AtomicU64,
     pub files_skipped: AtomicU64,
     pub link_enospc: AtomicU64,
+    /// Files or paths skipped because of I/O errors (logged, not fatal).
+    pub errors: AtomicU64,
+    /// Dry-run only: hashes whose .links entry would be created by this
+    /// run. The first file of a hash becomes the canonical entry and
+    /// frees nothing; only subsequent duplicates count.
+    dry_run_links: std::sync::Mutex<HashSet<String>>,
 }
 
 pub struct Options {
@@ -96,7 +101,11 @@ fn replace_with_link(path: &Path, link_path: &Path, store_dir: &Path) -> Result<
 
     let restore = scopeguard(parent, must_toggle);
 
-    let tmp = parent.join(format!(
+    // The temp link lives in the store root, like Nix's makeTempPath
+    // (optimise-store.cc): a crash must leave the stray file *outside* the
+    // store path, where the next GC removes it as unknown-on-disk. Inside
+    // the path it would permanently corrupt the path's NAR contents.
+    let tmp = store_dir.join(format!(
         ".tmp-link-{}-{}",
         std::process::id(),
         rand_suffix()
@@ -135,7 +144,7 @@ impl Drop for ParentRestore<'_> {
     fn drop(&mut self) {
         if self.active {
             let _ = fs::set_permissions(self.dir, fs::Permissions::from_mode(0o555));
-            let _ = filetime_set_zero(self.dir);
+            let _ = set_mtime_to_one(self.dir);
         }
     }
 }
@@ -155,7 +164,7 @@ fn dir_mutex(dir: &Path) -> &'static std::sync::Mutex<()> {
     &pool[h as usize % SHARDS]
 }
 
-fn filetime_set_zero(path: &Path) -> std::io::Result<()> {
+fn set_mtime_to_one(path: &Path) -> std::io::Result<()> {
     use nix::sys::stat::{UtimensatFlags, utimensat};
     use nix::sys::time::TimeSpec;
     utimensat(
@@ -197,7 +206,7 @@ async fn optimise_file(
         stats.files_skipped.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    if ft.is_file() && meta.len() < opts.min_size {
+    if meta.len() < opts.min_size {
         stats.files_skipped.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
@@ -214,8 +223,13 @@ async fn optimise_file(
         }
         Err(_) => {
             if opts.dry_run {
-                stats.files_linked.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
+                // First occurrence becomes the canonical link (no rename,
+                // nothing freed); only duplicates would be replaced.
+                let first = stats.dry_run_links.lock().unwrap().insert(hash.clone());
+                if !first {
+                    stats.files_linked.fetch_add(1, Ordering::Relaxed);
+                    stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
+                }
                 return Ok(());
             }
             match fs::hard_link(&path, &link_path) {
@@ -244,12 +258,8 @@ async fn optimise_file(
     if lmeta.ino() == meta.ino() {
         return Ok(());
     }
-    if opts.dry_run {
-        stats.files_linked.fetch_add(1, Ordering::Relaxed);
-        stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
-        return Ok(());
-    }
     // Size mismatch means a corrupt .links entry; don't merge.
+    // Checked before the dry-run accounting: a real run skips these too.
     if lmeta.len() != meta.len() {
         log::warn!(
             "link {} has size {} but file {} has size {}; skipping",
@@ -258,6 +268,11 @@ async fn optimise_file(
             path.display(),
             meta.len()
         );
+        return Ok(());
+    }
+    if opts.dry_run {
+        stats.files_linked.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_freed.fetch_add(meta.len(), Ordering::Relaxed);
         return Ok(());
     }
 
@@ -302,28 +317,6 @@ fn libc_emlink() -> i32 {
     nix::errno::Errno::EMLINK as i32
 }
 
-/// Hold gc.lock shared for the whole run so the GC (which takes it
-/// exclusive) cannot delete paths from under us.
-fn shared_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
-    let lock_path = state_dir.join("gc.lock");
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("opening {}", lock_path.display()))?;
-    match Flock::lock(f, FlockArg::LockSharedNonblock) {
-        Ok(l) => Ok(l),
-        Err((f, _)) => {
-            log::info!("waiting for garbage collector to finish...");
-            Flock::lock(f, FlockArg::LockShared)
-                .map_err(|(_, e)| e)
-                .context("acquiring shared gc.lock")
-        }
-    }
-}
-
 pub async fn optimise_store(opts: Options) -> Result<Stats> {
     let links_dir = opts.store_dir.join(".links");
     if !opts.dry_run {
@@ -332,12 +325,21 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
             .with_context(|| format!("creating {}", links_dir.display()))?;
     }
 
-    let _gc_lock = shared_gc_lock(&opts.state_dir)?;
+    // Like Nix's optimiseStore: register each path as a temp root right
+    // before working on it instead of holding gc.lock shared for the
+    // whole (potentially hours-long) run, which would block every GC.
+    // Dry runs touch nothing and take no roots.
+    let mut temp_roots = if opts.dry_run {
+        None
+    } else {
+        Some(fast_nix_common::temp_roots::TempRoots::create(
+            &opts.state_dir,
+        )?)
+    };
 
     let db = NixDb::open(&opts.store_dir, &opts.state_dir)?;
     let store_dir_typed: StoreDir = db.store_dir_typed()?;
     let paths = db.valid_store_paths()?;
-    drop(db);
     log::info!("optimising {} store paths", paths.len());
 
     let t0 = std::time::Instant::now();
@@ -364,13 +366,25 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
 
     let producer = {
         let known = known_inodes.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
             let mut walks: JoinSet<Result<()>> = JoinSet::new();
             for store_path in paths {
                 let permit = walk_sem.clone().acquire_owned().await?;
                 let known = known.clone();
+                let stats = stats.clone();
                 let tx = file_tx.clone();
                 let store_path = store_path.to_absolute_path(&store_dir_typed);
+                if let Some(tr) = temp_roots.as_mut() {
+                    let path_str = store_path.to_string_lossy();
+                    tr.add(&path_str)
+                        .with_context(|| format!("registering temp root {path_str}"))?;
+                    // A GC running before our registration may have deleted
+                    // the path (Nix: "path was GC'ed, probably").
+                    if !db.is_valid_path(&path_str)? {
+                        continue;
+                    }
+                }
                 walks.spawn(async move {
                     let files = tokio::task::spawn_blocking(
                         move || -> Result<Vec<(PathBuf, fs::Metadata)>> {
@@ -414,15 +428,29 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
                             Ok(out)
                         },
                     )
-                    .await??;
-                    // Walk done; release the slot before potentially
-                    // blocking on a full channel.
-                    drop(permit);
+                    .await?;
+                    // One unreadable path must not abort the whole run;
+                    // log and dedup the rest, like nix-store --optimise.
+                    let files = match files {
+                        Ok(f) => f,
+                        Err(e) => {
+                            log::warn!("skipping store path: {e:#}");
+                            stats.errors.fetch_add(1, Ordering::Relaxed);
+                            drop(permit);
+                            return Ok(());
+                        }
+                    };
+                    // Hold the permit until the file list is drained:
+                    // releasing it earlier lets new walks pile up while
+                    // this one blocks on a full channel, accumulating
+                    // store-wide metadata in memory. No deadlock: the
+                    // consumer never takes walk permits.
                     for f in files {
                         if tx.send(f).await.is_err() {
                             break;
                         }
                     }
+                    drop(permit);
                     Ok(())
                 });
                 while let Some(res) = walks.try_join_next() {
@@ -432,7 +460,10 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
             while let Some(res) = walks.join_next().await {
                 res??;
             }
-            anyhow::Ok(())
+            // Hand the temp roots back so they outlive the link workers,
+            // not just the walks: dropping them here would release the
+            // temproots flock while files are still being replaced.
+            anyhow::Ok(temp_roots)
         })
     };
 
@@ -443,29 +474,30 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
         let opts = opts.clone();
         let stats = stats.clone();
         tasks.spawn(async move {
+            let stats2 = stats.clone();
             let _p = permit;
-            optimise_file(file, meta, links_dir, store_dir, opts, stats).await
+            if let Err(e) = optimise_file(file, meta, links_dir, store_dir, opts, stats).await {
+                log::warn!("skipping file: {e:#}");
+                stats2.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
         });
         while let Some(res) = tasks.try_join_next() {
             res??;
         }
     }
 
-    producer.await??;
+    let temp_roots = producer.await??;
     while let Some(res) = tasks.join_next().await {
         res??;
     }
+    drop(temp_roots);
 
     Ok(Arc::into_inner(stats).expect("all tasks joined"))
 }
 
 pub fn cli_main() -> Result<()> {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(log::LevelFilter::Info);
-    log::set_boxed_logger(Box::new(StderrLogger(level))).unwrap();
-    log::set_max_level(level);
+    fast_nix_common::logging::init();
 
     let opts = parse_args()?;
     let dry = opts.dry_run;
@@ -485,6 +517,14 @@ pub fn cli_main() -> Result<()> {
     let enospc = stats.link_enospc.load(Ordering::Relaxed);
     if enospc > 0 {
         log::warn!("could not create {enospc} link(s): no space left on device");
+    }
+    let errors = stats.errors.load(Ordering::Relaxed);
+    if errors > 0 {
+        log::warn!("skipped {errors} file(s)/path(s) due to errors");
+    }
+    let skipped = stats.files_skipped.load(Ordering::Relaxed);
+    if skipped > 0 {
+        log::info!("{skipped} file(s) skipped (writable or below --min-size)");
     }
     let linked = stats.files_linked.load(Ordering::Relaxed);
     let freed = stats.bytes_freed.load(Ordering::Relaxed);
@@ -507,16 +547,17 @@ pub fn cli_main() -> Result<()> {
 fn parse_args() -> Result<Options> {
     let mut p = pico_args::Arguments::from_env();
     if p.contains("--help") {
-        eprintln!("Usage: fast-nix-optimise [OPTIONS]");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("      --dry-run             Show what would be done");
-        eprintln!("      --min-size BYTES      Skip files smaller than BYTES");
-        eprintln!("  -j, --jobs N              Concurrency [default: num CPUs]");
-        eprintln!("      --store-dir PATH      Nix store directory [default: /nix/store]");
-        eprintln!("      --state-dir PATH      Nix state directory [default: /nix/var/nix]");
+        println!("Usage: fast-nix-optimise [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("      --dry-run             Show what would be done");
+        println!("      --min-size BYTES      Skip files smaller than BYTES");
+        println!("  -j, --jobs N              Concurrency [default: num CPUs]");
+        println!("      --store-dir PATH      Nix store directory [default: /nix/store]");
+        println!("      --state-dir PATH      Nix state directory [default: /nix/var/nix]");
         std::process::exit(0);
     }
+
     let mut opts = Options {
         dry_run: p.contains("--dry-run"),
         ..Options::default()
@@ -528,6 +569,9 @@ fn parse_args() -> Result<Options> {
         .opt_value_from_str("--jobs")?
         .or(p.opt_value_from_str("-j")?)
     {
+        if v == 0 {
+            bail!("--jobs must be at least 1");
+        }
         opts.jobs = v;
     }
     if let Some(v) = p.opt_value_from_str("--store-dir")? {
@@ -541,19 +585,6 @@ fn parse_args() -> Result<Options> {
         bail!("unexpected arguments: {:?}", rest);
     }
     Ok(opts)
-}
-
-struct StderrLogger(log::LevelFilter);
-impl log::Log for StderrLogger {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= self.0
-    }
-    fn log(&self, r: &log::Record) {
-        if self.enabled(r.metadata()) {
-            eprintln!("[{:5}] {}", r.level(), r.args());
-        }
-    }
-    fn flush(&self) {}
 }
 
 #[cfg(test)]
@@ -694,16 +725,6 @@ mod tests {
         assert_ne!(libc_enospc(), libc_emlink());
     }
 
-    #[test]
-    fn logger_respects_level_filter() {
-        use log::Log as _;
-        let logger = StderrLogger(log::LevelFilter::Info);
-        let info = log::Metadata::builder().level(log::Level::Info).build();
-        let debug = log::Metadata::builder().level(log::Level::Debug).build();
-        assert!(logger.enabled(&info));
-        assert!(!logger.enabled(&debug));
-    }
-
     const CONTENT: &[u8] = b"hello world hello world hello world\n";
 
     async fn run_two_identical(
@@ -754,11 +775,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dry_run_counts_but_does_not_link() {
         let (stats, f1, f2, _tmp) = run_two_identical(0, true).await;
-        // .links is empty in dry-run, so both files count as linkable.
-        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 2);
+        // The first file would become the canonical .links entry and
+        // frees nothing; only the duplicate counts — matching a real run.
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 1);
         assert_eq!(
             stats.bytes_freed.load(Ordering::Relaxed),
-            2 * CONTENT.len() as u64
+            CONTENT.len() as u64
         );
         assert_ne!(
             fs::metadata(&f1).unwrap().ino(),
@@ -849,18 +871,60 @@ mod tests {
         unlock(&p2);
     }
 
-    #[test]
-    fn shared_gc_lock_blocks_exclusive() {
-        use nix::fcntl::{Flock, FlockArg};
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registers_temp_roots_for_optimised_paths() {
         let tmp = tempdir().unwrap();
-        let _shared = shared_gc_lock(tmp.path()).unwrap();
-        // GC takes the lock exclusive; while we hold it shared, the
-        // exclusive non-blocking attempt must fail.
-        let f = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(tmp.path().join("gc.lock"))
-            .unwrap();
-        assert!(Flock::lock(f, FlockArg::LockExclusiveNonblock).is_err());
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let p1 = mk_store_path(&store, "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-q", CONTENT);
+        let p2 = mk_store_path(&store, "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-r", CONTENT);
+        mk_db(&state, &[&p1, &p2]);
+
+        optimise_store(run_opts(&store, &state)).await.unwrap();
+
+        // Every optimised path was registered in our temproots file, so a
+        // concurrent GC would not have deleted it mid-replace.
+        let roots = fs::read(state.join("temproots").join(std::process::id().to_string())).unwrap();
+        let roots = String::from_utf8(roots).unwrap();
+        assert!(roots.contains(p1.to_str().unwrap()), "{roots}");
+        assert!(roots.contains(p2.to_str().unwrap()), "{roots}");
+        unlock(&p1);
+        unlock(&p2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dry_run_takes_no_temp_roots() {
+        let (_stats, _f1, _f2, tmp) = run_two_identical(0, true).await;
+        let tr = tmp
+            .path()
+            .join("state/temproots")
+            .join(std::process::id().to_string());
+        assert!(!tr.exists(), "dry run must not write temp roots");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_path_is_skipped_not_fatal() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root bypasses permission checks
+        }
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let bad = mk_store_path(&store, "llllllllllllllllllllllllllllllll-l", CONTENT);
+        let p1 = mk_store_path(&store, "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-m", CONTENT);
+        let p2 = mk_store_path(&store, "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-n", CONTENT);
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        mk_db(&state, &[&bad, &p1, &p2]);
+
+        let stats = optimise_store(run_opts(&store, &state)).await.unwrap();
+
+        // The unreadable path is skipped; the other two still dedup.
+        assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 1);
+        unlock(&bad);
+        unlock(&p1);
+        unlock(&p2);
     }
 }

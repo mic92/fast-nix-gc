@@ -291,6 +291,7 @@ fn gc_cleans_unused_links_only_when_not_dry_run() {
     let pkg = store.add_path("linked", 100);
     store.add_root("linked-root", &pkg);
     fs::hard_link(&shared_link, pkg.path.join("shared")).unwrap();
+    fs::hard_link(&shared_link, pkg.path.join("shared2")).unwrap();
 
     store.run_gc_ok(&["--dry-run"]);
     assert!(dead_link.exists(), "dry run must not clean links");
@@ -298,7 +299,8 @@ fn gc_cleans_unused_links_only_when_not_dry_run() {
     let out = store.run_gc_ok(&[]);
     assert!(!dead_link.exists(), "unreferenced link removed");
     assert!(shared_link.exists(), "referenced link kept");
-    // "referenced" is 10 bytes with nlink 2: savings = (2-1)*10.
+    // "referenced" is 10 bytes with nlink 3 (one .links entry + two store
+    // copies): dedup saves (3-2)*10 over independent copies.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("currently saving 10 bytes"),
@@ -729,24 +731,24 @@ fn gc_keeps_deriver_of_alive_path() {
 }
 
 #[test]
-fn gc_keeps_ca_deriver_via_derivation_outputs() {
+fn gc_deletes_drv_when_output_deriver_is_unset() {
     let store = TestStore::new();
 
-    // Content-addressed derivation: deriver field is NOT set on the output,
-    // but DerivationOutputs maps drv -> output path.
+    // Output with NULL deriver but a DerivationOutputs row: Nix's
+    // keep-derivations pins drvs only via ValidPaths.deriver (gc.cc
+    // requires queryPathInfo(out)->deriver == drv), so the drv is garbage.
     let drv = store.add_path("ca-pkg.drv", 50);
     let out = store.add_path("ca-pkg", 200);
-    // No set_deriver — simulates CA where ValidPaths.deriver is NULL.
     store.add_drv_output(&drv, "out", &out);
     store.add_root("ca-out-root", &out);
-    let trash = store.add_path("trash", 100);
 
     store.run_gc_ok(&[]);
 
-    // keep-derivations: CA output keeps its .drv alive via DerivationOutputs.
     assert!(out.path.exists(), "output deleted");
-    assert!(drv.path.exists(), "CA deriver deleted despite alive output");
-    assert!(!trash.path.exists());
+    assert!(
+        !drv.path.exists(),
+        "drv kept despite no alive path naming it as deriver"
+    );
 }
 
 #[test]
@@ -880,22 +882,345 @@ fn gc_keeps_ca_output_via_build_trace() {
 }
 
 #[test]
-fn gc_keeps_ca_deriver_via_build_trace() {
-    // Alive CA output should keep its drv alive via BuildTraceV3.
+fn gc_keeps_ca_deriver_via_deriver_field_not_build_trace() {
+    // An alive CA output keeps its drv only through ValidPaths.deriver,
+    // like Nix; a BuildTraceV3 row alone must not pin the drv (the
+    // output may have been rebuilt by a newer drv since).
     let store = TestStore::new();
 
+    let stale_drv = store.add_path("dyn-pkg-old.drv", 50);
     let drv = store.add_path("dyn-pkg.drv", 50);
     let out = store.add_path("dyn-pkg-out", 200);
+    store.add_build_trace(&stale_drv, "out", &out);
     store.add_build_trace(&drv, "out", &out);
+    store.set_deriver(&out, &drv);
     store.add_root("out-root", &out);
-    let trash = store.add_path("trash", 100);
 
     store.run_gc_ok(&[]);
 
     assert!(out.path.exists(), "output deleted");
+    assert!(drv.path.exists(), "deriver deleted despite alive output");
     assert!(
-        drv.path.exists(),
-        "CA deriver deleted despite alive output (BuildTraceV3)"
+        !stale_drv.path.exists(),
+        "stale drv kept via BuildTraceV3 alone"
+    );
+}
+
+#[test]
+fn gc_store_dir_trailing_slash_is_normalized() {
+    // "--store-dir /path/" must behave like "--store-dir /path"; an
+    // unnormalized prefix would make every DB path look dead.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    store.add_root("lib-root", &lib);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(format!("{}/", store.store_dir.display()))
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(lib.path.exists() && store.in_db(&lib), "live path deleted");
+}
+
+#[test]
+fn gc_refuses_store_dir_mismatching_db() {
+    // A store dir that matches no DB path means the DB belongs to a
+    // different store; deleting "garbage" would wipe everything.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    store.add_root("lib-root", &lib);
+
+    let other = store.dir.path().join("other-store");
+    fs::create_dir_all(&other).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(&other)
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "GC must refuse a mismatched store dir"
+    );
+    assert!(lib.path.exists() && store.in_db(&lib));
+}
+
+#[test]
+fn gc_fails_when_roots_dir_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        // Root bypasses permission checks; cannot simulate EACCES.
+        return;
+    }
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    let sub = store.state_dir.join("gcroots/sub");
+    fs::create_dir_all(&sub).unwrap();
+    std::os::unix::fs::symlink(&lib.path, sub.join("lib-root")).unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = store.run_gc(&[]);
+
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !out.status.success(),
+        "GC must fail closed when a roots dir is unreadable"
+    );
+    assert!(lib.path.exists() && store.in_db(&lib), "live path deleted");
+}
+
+#[test]
+fn gc_keeps_auto_root_with_unreadable_target() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        return; // root bypasses permission checks
+    }
+    // An EACCES on the indirect target says nothing about its existence;
+    // the auto link must survive and the GC must fail closed.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    let auto = store.state_dir.join("gcroots/auto");
+    fs::create_dir_all(&auto).unwrap();
+    let private = store.dir.path().join("private");
+    fs::create_dir_all(&private).unwrap();
+    let user_link = private.join("result");
+    std::os::unix::fs::symlink(&lib.path, &user_link).unwrap();
+    std::os::unix::fs::symlink(&user_link, auto.join("x0")).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = store.run_gc(&[]);
+
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!out.status.success(), "GC must fail closed");
+    assert!(
+        auto.join("x0").symlink_metadata().is_ok(),
+        "auto root removed"
+    );
+    assert!(lib.path.exists());
+}
+
+#[test]
+fn gc_removes_dangling_auto_root() {
+    let store = TestStore::new();
+    let auto = store.state_dir.join("gcroots/auto");
+    fs::create_dir_all(&auto).unwrap();
+    std::os::unix::fs::symlink(store.dir.path().join("gone"), auto.join("x1")).unwrap();
+
+    store.run_gc_ok(&[]);
+
+    assert!(
+        auto.join("x1").symlink_metadata().is_err(),
+        "dangling auto root must be removed"
+    );
+}
+
+#[test]
+fn gc_keeps_lock_file_of_active_build() {
+    let store = TestStore::new();
+
+    // Builder holds a temp root for the path it is building; its .lock
+    // sibling (not in the DB) shares the hash part and must survive.
+    let alive = store.add_path("being-built", 100);
+    let basename = alive
+        .full
+        .strip_prefix(&format!("{}/", store.store_dir.display()))
+        .unwrap();
+    let lock_file = store.store_dir.join(format!("{basename}.lock"));
+    fs::write(&lock_file, "").unwrap();
+    // Unrelated stale lock file: still garbage.
+    let stale_lock = store
+        .store_dir
+        .join(format!("{}-stale.lock", fake_hash("stale")));
+    fs::write(&stale_lock, "").unwrap();
+
+    let tmp_file = store.state_dir.join("temproots/4242");
+    let mut data = alive.full.clone().into_bytes();
+    data.push(0);
+    fs::write(&tmp_file, &data).unwrap();
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&tmp_file)
+        .unwrap();
+    let lock = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockSharedNonblock).unwrap();
+
+    store.run_gc_ok(&[]);
+
+    assert!(lock_file.exists(), "active build's .lock file deleted");
+    assert!(!stale_lock.exists(), "stale lock file kept");
+    drop(lock);
+}
+
+#[test]
+fn gc_deletes_non_utf8_store_entry() {
+    use std::os::unix::ffi::OsStrExt;
+    let store = TestStore::new();
+    let raw = std::ffi::OsStr::from_bytes(b"junk-\xff\xfe-entry");
+    let path = store.store_dir.join(raw);
+    fs::write(&path, "garbage").unwrap();
+
+    let out = store.run_gc_ok(&[]);
+
+    assert!(
+        path.symlink_metadata().is_err(),
+        "non-UTF-8 garbage entry must be deleted"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 store paths deleted"), "stdout: {stdout}");
+}
+
+#[test]
+fn gc_does_not_hang_on_tmp_fifo() {
+    let store = TestStore::new();
+    let fifo = store.store_dir.join("tmp-fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits(0o644).unwrap()).unwrap();
+
+    // Must terminate (no blocking open) and remove the FIFO.
+    store.run_gc_ok(&[]);
+    assert!(fifo.symlink_metadata().is_err(), "FIFO not collected");
+}
+
+#[test]
+fn gc_removes_reserved_space_file_and_creates_private_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let store = TestStore::new();
+    let reserved = store.state_dir.join("db/reserved");
+    fs::write(&reserved, vec![b'X'; 1024]).unwrap();
+
+    store.run_gc_ok(&[]);
+
+    assert!(!reserved.exists(), "reserved space file must be freed");
+    let mode = fs::metadata(store.state_dir.join("gc.lock"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "gc.lock must not be lockable by other users");
+}
+
+/// Connect to the gc-socket during the early window (before the graph is
+/// loaded), register a root, and let the GC continue.
+fn run_gc_with_early_root(
+    store: &TestStore,
+    root: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
+    use std::io::{Read, Write};
+
+    let fifo = store.dir.path().join("sync-early");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits(0o600).unwrap()).unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(&store.store_dir)
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .args(extra_args)
+        .env("_FAST_NIX_GC_TEST_SYNC_EARLY", &fifo)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Blocks until the GC reached the sync point: lock held, early
+    // socket up, graph not loaded yet.
+    let fifo_w = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+
+    let sock = store.state_dir.join("gc-socket/socket");
+    let mut conn = std::os::unix::net::UnixStream::connect(&sock)
+        .expect("gc-socket must be served before the graph is loaded");
+    conn.write_all(format!("{root}\n").as_bytes()).unwrap();
+    let mut ack = [0u8; 1];
+    conn.read_exact(&mut ack).unwrap();
+    assert_eq!(ack, [b'1'], "early root must be acked immediately");
+
+    drop(fifo_w); // release the GC
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+#[test]
+fn gc_socket_serves_before_graph_load_and_keeps_early_roots() {
+    let store = TestStore::new();
+    let dead = store.add_path("now-needed", 100);
+    let trash = store.add_path("trash", 100);
+
+    run_gc_with_early_root(&store, &dead.full, &[]);
+
+    assert!(
+        dead.path.exists() && store.in_db(&dead),
+        "early-socket root was deleted"
     );
     assert!(!trash.path.exists());
+}
+
+#[test]
+fn gc_dry_run_serves_socket_and_honors_roots() {
+    let store = TestStore::new();
+    let dead = store.add_path("now-needed", 100);
+    let trash = store.add_path("trash", 100);
+
+    let out = run_gc_with_early_root(&store, &dead.full, &["--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(&dead.full),
+        "protected path reported as dead: {stdout}"
+    );
+    assert!(stdout.contains(&trash.full), "stdout: {stdout}");
+    assert!(dead.path.exists() && trash.path.exists());
+}
+
+#[test]
+fn gc_socket_root_mid_gc_keeps_path_and_deletes_rest() {
+    // Mirror of the NixOS test's gc-socket phase: while the delete loop is
+    // blocked on _FAST_NIX_GC_TEST_SYNC, protect one dead path over the
+    // socket; after release, it survives and the other dead path is gone.
+    use std::io::{Read, Write};
+    let store = TestStore::new();
+    let saved = store.add_path("saved", 10);
+    let other = store.add_path("other", 10);
+
+    let fifo = store.dir.path().join("sync.fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits(0o600).unwrap()).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(&store.store_dir)
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .env("_FAST_NIX_GC_TEST_SYNC", &fifo)
+        .spawn()
+        .unwrap();
+
+    let fifo_w = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+
+    let sock = store.state_dir.join("gc-socket/socket");
+    let mut conn = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    conn.write_all(format!("{}\n", saved.full).as_bytes())
+        .unwrap();
+    let mut ack = [0u8; 1];
+    conn.read_exact(&mut ack).unwrap();
+    assert_eq!(ack, [b'1']);
+
+    drop(fifo_w);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    assert!(saved.path.exists() && store.in_db(&saved), "saved deleted");
+    assert!(!other.path.exists(), "other survived");
+    assert!(!store.in_db(&other));
 }

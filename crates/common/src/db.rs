@@ -14,33 +14,64 @@ pub struct NixDb {
     pub real_store_dir: PathBuf,
     pub links_dir: PathBuf,
     /// Mirror of Nix's `keep-derivations` setting (default: true).
-    /// When set, .drv files of alive outputs are kept alive, and alive
-    /// .drv files keep their outputs alive.
+    /// When set, an alive path keeps its deriver (`ValidPaths.deriver`)
+    /// alive.
     pub keep_derivations: bool,
     /// Mirror of Nix's `keep-outputs` setting (default: false).
-    /// When set, outputs of alive derivations are kept alive, and alive
-    /// outputs keep their derivers alive.
+    /// When set, an alive .drv file keeps its outputs alive.
     pub keep_outputs: bool,
 }
 
 impl NixDb {
     pub fn open(store_dir: &Path, state_dir: &Path) -> Result<Self> {
+        Self::open_with_mode(store_dir, state_dir, false)
+    }
+
+    /// Read-only open for dry runs: no journal-mode flip, no write lock,
+    /// works on a read-only filesystem.
+    pub fn open_read_only(store_dir: &Path, state_dir: &Path) -> Result<Self> {
+        Self::open_with_mode(store_dir, state_dir, true)
+    }
+
+    fn open_with_mode(store_dir: &Path, state_dir: &Path, read_only: bool) -> Result<Self> {
+        // "/nix/store/" must equal "/nix/store": every prefix comparison
+        // against DB paths appends its own '/'. A trailing slash would make
+        // the basename index empty and the whole store look dead.
+        let store_dir = normalize_dir(store_dir);
+        let store_dir = store_dir.as_path();
         let db_path = state_dir.join("db/db.sqlite");
-        let conn = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening {}", db_path.display()))?;
+        let rw_flag = if read_only {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        };
+        let conn = Connection::open_with_flags(&db_path, rw_flag | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_context(|| format!("opening {}", db_path.display()))?;
 
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        if !read_only {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+        }
+        // Nix's schema relies on FK actions (DerivationOutputs/Refs rows
+        // cascade when a ValidPaths row goes away), but SQLite only honors
+        // them with the pragma on. Without it every invalidation leaks
+        // orphaned DerivationOutputs rows.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        // nix-daemon may hold short write locks; fail with SQLITE_BUSY only
+        // after a grace period, like Nix's busy handler.
+        conn.busy_timeout(std::time::Duration::from_secs(60))?;
 
+        // Like Nix's realStoreDir: the physical directory when store_dir
+        // is a symlink (the DB keeps logical paths, disk ops want real
+        // ones). Falls back to the logical dir if it can't be resolved.
+        let real_store_dir =
+            std::fs::canonicalize(store_dir).unwrap_or_else(|_| store_dir.to_path_buf());
         Ok(NixDb {
             conn,
             store_dir: store_dir.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
-            real_store_dir: store_dir.to_path_buf(),
-            links_dir: store_dir.join(".links"),
+            links_dir: real_store_dir.join(".links"),
+            real_store_dir,
             // Read the resolved nix.conf via `nix config show`; defaults
             // match Nix if it's not in PATH.
             keep_derivations: crate::nix_config::bool_setting("keep-derivations", true),
@@ -64,7 +95,17 @@ impl NixDb {
         // Both queries must see the same snapshot, otherwise a path
         // registered between them ends up with missing edges.
         self.conn.execute_batch("BEGIN")?;
+        let result = self.load_graph_in_txn();
+        if result.is_err() {
+            // Leave the connection usable for the caller.
+            self.conn.execute_batch("ROLLBACK").ok();
+        } else {
+            self.conn.execute_batch("COMMIT")?;
+        }
+        result
+    }
 
+    fn load_graph_in_txn(&self) -> Result<StoreGraph> {
         // ids are dense autoincrement, so a Vec works as the id->idx map.
         let max_id: i64 =
             self.conn
@@ -101,40 +142,50 @@ impl NixDb {
         let n = paths.len();
         let mut edges: Vec<(u32, u32)> = Vec::new();
 
-        let mut add_edges = |conn: &Connection, sql: &str| -> Result<()> {
-            let mut stmt = conn.prepare(sql)?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let from_id: i64 = row.get(0)?;
-                let to_id: i64 = row.get(1)?;
-                let from = *id_to_idx.get(from_id as usize).unwrap_or(&MISSING);
-                let to = *id_to_idx.get(to_id as usize).unwrap_or(&MISSING);
-                if from != MISSING && to != MISSING {
-                    edges.push((from, to));
+        let mut add_edges =
+            |conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<()> {
+                let mut stmt = conn.prepare(sql)?;
+                let mut rows = stmt.query(params)?;
+                while let Some(row) = rows.next()? {
+                    let from_id: i64 = row.get(0)?;
+                    let to_id: i64 = row.get(1)?;
+                    let from = *id_to_idx.get(from_id as usize).unwrap_or(&MISSING);
+                    let to = *id_to_idx.get(to_id as usize).unwrap_or(&MISSING);
+                    if from != MISSING && to != MISSING {
+                        edges.push((from, to));
+                    }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
 
         // Refs table: direct references between store paths.
-        add_edges(&self.conn, "SELECT referrer, reference FROM Refs")?;
+        add_edges(&self.conn, "SELECT referrer, reference FROM Refs", &[])?;
 
-        // Edge directions mirror Nix's computeFSClosure (misc.cc), which
-        // the GC calls with includeOutputs = keep-outputs and
-        // includeDerivers = keep-derivations:
-        //   keep-derivations: alive output keeps its drv alive (output→drv)
-        //   keep-outputs:     alive drv keeps its outputs alive (drv→output)
+        // Edge directions mirror exactly what Nix's GC propagates
+        // (gc.cc maybeDeleteReferrersClosure + misc.cc computeFSClosure
+        // with includeOutputs = keep-outputs, includeDerivers =
+        // keep-derivations):
         //
-        // drv↔output mappings come from three places:
-        // - ValidPaths.deriver (all Nix versions; also covers CA outputs of
-        //   Nix ≤2.34, whose Realisations table keys drvPath by content
-        //   hash and so can't be joined against ValidPaths)
-        // - DerivationOutputs (input-addressed)
-        // - BuildTraceV3 (CA/dynamic derivations, Nix ≥2.35): drvPath is a
-        //   store path *basename*, outputPath a full store path. Created
-        //   lazily; skip if absent.
-        let has_build_trace = (self.keep_derivations || self.keep_outputs)
-            && Self::has_table(&self.conn, "BuildTraceV3")?;
+        //   keep-derivations: an alive path keeps `info->deriver` alive.
+        //     Edge output→drv via ValidPaths.deriver ONLY. The referrer
+        //     walk's condition (output of drv with deriver == drv) is a
+        //     subset of this. Nix does NOT pin a drv merely because a
+        //     DerivationOutputs/BuildTraceV3 row maps one of its outputs:
+        //     if the output's deriver is a different (newer) drv, the old
+        //     drv is garbage.
+        //
+        //   keep-outputs: an alive drv keeps its outputs alive.
+        //     Edge drv→output via the drv's output map: DerivationOutputs
+        //     for input-addressed outputs, BuildTraceV3 for CA/dynamic
+        //     outputs (Nix ≥2.35; drvPath is a store path *basename*,
+        //     outputPath a full store path; created lazily, skip if
+        //     absent), plus ValidPaths.deriver. The deriver edge is a
+        //     subset of Nix's relation (deriver == drv implies the path is
+        //     in the drv's output map) and is the only usable drv→output
+        //     mapping for CA outputs of Nix ≤2.34, whose Realisations
+        //     table keys drvPath by content hash and so can't be joined
+        //     against ValidPaths.
+        let has_build_trace = self.keep_outputs && Self::has_table(&self.conn, "BuildTraceV3")?;
         let store_prefix = format!("{}/", self.store_dir.display());
 
         if self.keep_derivations {
@@ -144,25 +195,8 @@ impl NixDb {
                 "SELECT v.id, d.id FROM ValidPaths v \
                  JOIN ValidPaths d ON d.path = v.deriver \
                  WHERE v.deriver IS NOT NULL",
+                &[],
             )?;
-            // output → drv via DerivationOutputs (covers outputs whose
-            // deriver column is unset)
-            add_edges(
-                &self.conn,
-                "SELECT o.id, do2.drv FROM ValidPaths o \
-                 JOIN DerivationOutputs do2 ON do2.path = o.path",
-            )?;
-            if has_build_trace {
-                // output → drv via BuildTraceV3
-                add_edges(
-                    &self.conn,
-                    &format!(
-                        "SELECT o.id, d.id FROM BuildTraceV3 bt \
-                         JOIN ValidPaths o ON o.path = bt.outputPath \
-                         JOIN ValidPaths d ON d.path = '{store_prefix}' || bt.drvPath"
-                    ),
-                )?;
-            }
         }
 
         if self.keep_outputs {
@@ -171,28 +205,35 @@ impl NixDb {
                 &self.conn,
                 "SELECT do2.drv, o.id FROM DerivationOutputs do2 \
                  JOIN ValidPaths o ON o.path = do2.path",
+                &[],
             )?;
-            // drv → output via ValidPaths.deriver
+            // drv → output via ValidPaths.deriver (covers Realisations-era
+            // CA outputs; see the edge-direction comment above)
             add_edges(
                 &self.conn,
                 "SELECT d.id, v.id FROM ValidPaths v \
                  JOIN ValidPaths d ON d.path = v.deriver \
                  WHERE v.deriver IS NOT NULL",
+                &[],
             )?;
             if has_build_trace {
                 // drv → output via BuildTraceV3
                 add_edges(
                     &self.conn,
-                    &format!(
-                        "SELECT d.id, o.id FROM BuildTraceV3 bt \
-                         JOIN ValidPaths d ON d.path = '{store_prefix}' || bt.drvPath \
-                         JOIN ValidPaths o ON o.path = bt.outputPath"
-                    ),
+                    "SELECT d.id, o.id FROM BuildTraceV3 bt \
+                     JOIN ValidPaths d ON d.path = ? || bt.drvPath \
+                     JOIN ValidPaths o ON o.path = bt.outputPath",
+                    &[&store_prefix],
                 )?;
             }
         }
 
-        self.conn.execute_batch("COMMIT")?;
+        // CSR offsets are u32; refuse to build a graph the index type
+        // cannot address instead of silently wrapping.
+        anyhow::ensure!(
+            edges.len() <= u32::MAX as usize,
+            "store has more than 2^32 reference edges"
+        );
 
         let mut ref_offsets = vec![0u32; n + 1];
         for &(from, _) in &edges {
@@ -219,21 +260,15 @@ impl NixDb {
         })
     }
 
-    /// Return all valid store paths (full paths, e.g. `/nix/store/xxx-foo`).
-    pub fn valid_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT path FROM ValidPaths")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
     /// `StoreDir` view of `store_dir`. Fails if it isn't valid UTF-8.
     pub fn store_dir_typed(&self) -> Result<StoreDir> {
         StoreDir::new(self.store_dir.clone())
             .map_err(|e| anyhow!("{}: {e}", self.store_dir.display()))
     }
 
-    /// Like `valid_paths` but parsed into `StorePath`. Rows that don't parse
-    /// (corrupt DB) are returned as an error rather than silently dropped.
+    /// Return all valid store paths parsed into `StorePath`. Rows that
+    /// don't parse (corrupt DB) are returned as an error rather than
+    /// silently dropped.
     pub fn valid_store_paths(&self) -> Result<Vec<StorePath>> {
         let store_dir = self.store_dir_typed()?;
         let mut stmt = self.conn.prepare("SELECT path FROM ValidPaths")?;
@@ -283,6 +318,22 @@ impl NixDb {
                 "DELETE FROM Refs WHERE referrer IN (SELECT id FROM DeadPaths) \
                  OR reference IN (SELECT id FROM DeadPaths)",
             )?;
+            // Same for the CA realisations of Nix ≤2.34:
+            // RealisationsRefs.realisationReference is ON DELETE RESTRICT,
+            // and our bulk DELETE is unordered (Nix avoids the constraint
+            // by deleting one path at a time in topological order).
+            if Self::has_table(&self.conn, "Realisations")? {
+                self.conn.execute_batch(
+                    "DELETE FROM RealisationsRefs WHERE referrer IN \
+                         (SELECT id FROM Realisations WHERE outputPath IN \
+                             (SELECT id FROM DeadPaths)) \
+                     OR realisationReference IN \
+                         (SELECT id FROM Realisations WHERE outputPath IN \
+                             (SELECT id FROM DeadPaths)); \
+                     DELETE FROM Realisations WHERE outputPath IN \
+                         (SELECT id FROM DeadPaths)",
+                )?;
+            }
             self.conn
                 .execute_batch("DELETE FROM ValidPaths WHERE id IN (SELECT id FROM DeadPaths)")?;
             Ok(())
@@ -298,6 +349,17 @@ impl NixDb {
             }
         }
     }
+}
+
+/// Strip trailing slashes (but keep a bare "/").
+fn normalize_dir(dir: &Path) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = dir.as_os_str().as_bytes();
+    let mut end = bytes.len();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(bytes[..end].to_vec()))
 }
 
 /// In-memory snapshot of the store reference graph in CSR layout.
@@ -349,6 +411,18 @@ impl<'g> BasenameIndex<'g> {
 }
 
 impl StoreGraph {
+    /// Graph with no nodes, used while the real graph is still loading.
+    pub fn empty(store_prefix: String) -> StoreGraph {
+        StoreGraph {
+            paths: Vec::new(),
+            nar_sizes: Vec::new(),
+            registration_times: Vec::new(),
+            ref_offsets: vec![0],
+            ref_targets: Vec::new(),
+            store_prefix,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.paths.len()
     }
@@ -428,7 +502,8 @@ mod tests {
                  drv integer not null,
                  id text not null,
                  path text not null,
-                 primary key (drv, id)
+                 primary key (drv, id),
+                 foreign key (drv) references ValidPaths(id) on delete cascade
              );",
         )
         .unwrap();
@@ -561,7 +636,8 @@ mod tests {
         assert_eq!(g.refs(iout), &[idrv]);
         assert!(g.refs(idrv).is_empty());
 
-        // keep-outputs adds the reverse edge.
+        // keep-outputs: the deriver field alone pins the output (it is
+        // the only drv→output mapping for Realisations-era CA outputs).
         db.keep_outputs = true;
         let g = db.load_graph().unwrap();
         assert_eq!(g.refs(idrv), &[iout]);
@@ -589,12 +665,16 @@ mod tests {
             ))
             .unwrap();
 
+        // keep-derivations pins drvs only via the deriver field; a
+        // BuildTraceV3 row alone must not create an output→drv edge
+        // (the output may have been rebuilt by a newer drv).
         db.keep_derivations = true;
         let g = db.load_graph().unwrap();
         let iout = g.paths.iter().position(|p| p.ends_with("-pkg")).unwrap() as u32;
         let idrv = g.paths.iter().position(|p| p.ends_with(".drv")).unwrap() as u32;
-        assert_eq!(g.refs(iout), &[idrv]);
+        assert!(g.refs(iout).is_empty());
 
+        // keep-outputs pins CA outputs of an alive drv via BuildTraceV3.
         db.keep_derivations = false;
         db.keep_outputs = true;
         let g = db.load_graph().unwrap();
@@ -602,12 +682,17 @@ mod tests {
     }
 
     #[test]
-    fn valid_paths_and_typed_variants() {
+    fn valid_store_paths_and_typed_variants() {
         let t = setup();
         add_path(&t.db, &format!("{H1}-a"), 1, 1);
         add_path(&t.db, &format!("{H2}-b"), 1, 1);
 
-        let mut paths = t.db.valid_paths().unwrap();
+        let mut paths: Vec<String> =
+            t.db.valid_store_paths()
+                .unwrap()
+                .iter()
+                .map(|p| format!("/nix/store/{p}"))
+                .collect();
         paths.sort();
         assert_eq!(
             paths,
@@ -646,12 +731,88 @@ mod tests {
         t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
             .unwrap();
 
-        assert_eq!(t.db.valid_paths().unwrap(), vec![full(&format!("{H3}-c"))]);
+        let remaining: Vec<String> =
+            t.db.valid_store_paths()
+                .unwrap()
+                .iter()
+                .map(|p| format!("/nix/store/{p}"))
+                .collect();
+        assert_eq!(remaining, vec![full(&format!("{H3}-c"))]);
         let refs: i64 =
             t.db.conn
                 .query_row("SELECT COUNT(*) FROM Refs", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(refs, 0);
+    }
+
+    #[test]
+    fn invalidate_paths_cascades_derivation_outputs() {
+        let t = setup();
+        let drv = add_path(&t.db, &format!("{H1}-pkg.drv"), 1, 1);
+        let out = add_path(&t.db, &format!("{H2}-pkg"), 1, 1);
+        t.db.conn
+            .execute(
+                "INSERT INTO DerivationOutputs (drv, id, path) VALUES (?, 'out', ?)",
+                rusqlite::params![drv, full(&format!("{H2}-pkg"))],
+            )
+            .unwrap();
+        let _ = out;
+
+        let dead = [full(&format!("{H1}-pkg.drv"))];
+        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
+            .unwrap();
+
+        let n: i64 =
+            t.db.conn
+                .query_row("SELECT COUNT(*) FROM DerivationOutputs", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(n, 0, "DerivationOutputs row orphaned");
+    }
+
+    #[test]
+    fn invalidate_paths_clears_realisations_with_restrict_fk() {
+        // Nix ≤2.34 CA schema: RealisationsRefs.realisationReference is ON
+        // DELETE RESTRICT. Bulk-deleting two dead paths whose realisations
+        // reference each other must not trip the constraint.
+        let t = setup();
+        t.db.conn
+            .execute_batch(
+                "CREATE TABLE Realisations (
+                     id integer primary key autoincrement not null,
+                     drvPath text not null,
+                     outputName text not null,
+                     outputPath integer not null references ValidPaths(id) on delete cascade,
+                     signatures text
+                 );
+                 CREATE TABLE RealisationsRefs (
+                     referrer integer not null,
+                     realisationReference integer,
+                     foreign key (referrer) references Realisations(id) on delete cascade,
+                     foreign key (realisationReference) references Realisations(id) on delete restrict
+                 );",
+            )
+            .unwrap();
+        let a = add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        let b = add_path(&t.db, &format!("{H2}-b"), 1, 1);
+        t.db.conn
+            .execute_batch(&format!(
+                "INSERT INTO Realisations (drvPath, outputName, outputPath) \
+                     VALUES ('sha256:a!out', 'out', {a}), ('sha256:b!out', 'out', {b});
+                 INSERT INTO RealisationsRefs (referrer, realisationReference) VALUES (1, 2);"
+            ))
+            .unwrap();
+
+        let dead = [full(&format!("{H1}-a")), full(&format!("{H2}-b"))];
+        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
+            .unwrap();
+
+        for table in ["Realisations", "RealisationsRefs", "ValidPaths"] {
+            let n: i64 =
+                t.db.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+            assert_eq!(n, 0, "{table} not cleared");
+        }
     }
 
     #[test]

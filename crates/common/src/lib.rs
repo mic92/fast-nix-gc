@@ -1,4 +1,5 @@
 pub mod db;
+pub mod logging;
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -130,3 +131,4 @@ mod tests {
     }
 }
 pub mod nix_config;
+pub mod temp_roots;

@@ -19,7 +19,19 @@ pub fn bool_setting(key: &str, default: bool) -> bool {
         .output();
     let out = match out {
         Ok(o) if o.status.success() => o.stdout,
-        _ => return default,
+        // Don't fall back silently: a user who set e.g. keep-outputs=true
+        // in nix.conf should learn why it is being ignored.
+        Ok(o) => {
+            log::warn!(
+                "`nix config show {key}` failed ({}); using default {default}",
+                o.status
+            );
+            return default;
+        }
+        Err(e) => {
+            log::warn!("cannot run `nix config show {key}`: {e}; using default {default}");
+            return default;
+        }
     };
     parse_bool(&out).unwrap_or(default)
 }
