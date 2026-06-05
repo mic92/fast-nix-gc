@@ -448,53 +448,56 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     let paths_deleted = paths_deleted.into_inner() as usize;
 
     // Clean up unused hard links in .links
-    if !dry_run {
-        clean_links(&db.links_dir)?;
-    }
+    let bytes_freed = bytes_freed + clean_links(&db.links_dir)?;
 
     Ok((bytes_freed, paths_deleted))
 }
 
-/// Remove hard links with link count 1 from .links directory.
-/// The .links dir can contain millions of entries; stat + unlink per entry
-/// is disk-bound, so process in parallel.
-fn clean_links(links_dir: &Path) -> Result<()> {
-    use std::sync::atomic::AtomicI64;
-
+/// Remove hard links with link count 1 from .links directory, returning
+/// bytes freed. The .links dir can contain millions of entries; stat +
+/// unlink per entry is disk-bound, so process in parallel. Stream the
+/// entries instead of collecting them: a Vec of millions of DirEntries
+/// costs gigabytes of RSS.
+fn clean_links(links_dir: &Path) -> Result<u64> {
     log::info!("deleting unused links...");
-    let entries: Vec<_> = match fs::read_dir(links_dir) {
-        Ok(e) => e.flatten().collect(),
-        Err(_) => return Ok(()),
+    let entries = match fs::read_dir(links_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            log::warn!("cannot read {}: {e}", links_dir.display());
+            return Ok(0);
+        }
     };
 
-    // For each surviving link with N references, hard linking saves
-    // (N-1)*size bytes compared to N independent copies.
-    let saved_bytes = AtomicI64::new(0);
+    // A link entry has one reference from .links plus one per store file.
+    // N references total mean hard linking saves (N-2)*size compared to
+    // independent copies.
+    let saved_bytes = AtomicU64::new(0);
+    let freed_bytes = AtomicU64::new(0);
 
-    entries.par_iter().for_each(|entry| {
+    entries.flatten().par_bridge().for_each(|entry| {
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             return;
         };
         if meta.nlink() != 1 {
             saved_bytes.fetch_add(
-                (meta.nlink() as i64 - 1) * meta.size() as i64,
+                meta.nlink().saturating_sub(2) * meta.size(),
                 Ordering::Relaxed,
             );
             return;
         }
-        fs::remove_file(&path).ok();
+        if fs::remove_file(&path).is_ok() {
+            freed_bytes.fetch_add(meta.blocks() * 512, Ordering::Relaxed);
+        }
     });
 
     let saving = saved_bytes.into_inner();
     if saving > 0 {
-        log::info!(
-            "hard linking is currently saving {}",
-            format_size(saving as u64)
-        );
+        log::info!("hard linking is currently saving {}", format_size(saving));
     }
 
-    Ok(())
+    Ok(freed_bytes.into_inner())
 }
 
 #[cfg(test)]
@@ -566,11 +569,13 @@ mod tests {
         fs::write(&shared, b"referenced").unwrap();
         fs::hard_link(&shared, tmp.path().join("user")).unwrap();
 
-        clean_links(&links).unwrap();
+        let dead_blocks = fs::symlink_metadata(&dead).unwrap().blocks() * 512;
+        let freed = clean_links(&links).unwrap();
 
         assert!(!dead.exists());
         assert!(shared.exists());
+        assert_eq!(freed, dead_blocks, "freed bytes of removed links");
         // Missing .links dir is not an error.
-        clean_links(&tmp.path().join("nope")).unwrap();
+        assert_eq!(clean_links(&tmp.path().join("nope")).unwrap(), 0);
     }
 }

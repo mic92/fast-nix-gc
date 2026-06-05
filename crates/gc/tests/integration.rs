@@ -291,6 +291,7 @@ fn gc_cleans_unused_links_only_when_not_dry_run() {
     let pkg = store.add_path("linked", 100);
     store.add_root("linked-root", &pkg);
     fs::hard_link(&shared_link, pkg.path.join("shared")).unwrap();
+    fs::hard_link(&shared_link, pkg.path.join("shared2")).unwrap();
 
     store.run_gc_ok(&["--dry-run"]);
     assert!(dead_link.exists(), "dry run must not clean links");
@@ -298,7 +299,8 @@ fn gc_cleans_unused_links_only_when_not_dry_run() {
     let out = store.run_gc_ok(&[]);
     assert!(!dead_link.exists(), "unreferenced link removed");
     assert!(shared_link.exists(), "referenced link kept");
-    // "referenced" is 10 bytes with nlink 2: savings = (2-1)*10.
+    // "referenced" is 10 bytes with nlink 3 (one .links entry + two store
+    // copies): dedup saves (3-2)*10 over independent copies.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("currently saving 10 bytes"),
