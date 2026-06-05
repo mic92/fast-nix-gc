@@ -525,6 +525,10 @@ pub fn cli_main() -> Result<()> {
     if errors > 0 {
         log::warn!("skipped {errors} file(s)/path(s) due to errors");
     }
+    let skipped = stats.files_skipped.load(Ordering::Relaxed);
+    if skipped > 0 {
+        log::info!("{skipped} file(s) skipped (writable or below --min-size)");
+    }
     let linked = stats.files_linked.load(Ordering::Relaxed);
     let freed = stats.bytes_freed.load(Ordering::Relaxed);
     if dry {
