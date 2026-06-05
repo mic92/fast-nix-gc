@@ -91,29 +91,8 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
     Ok(args)
 }
 
-/// Minimal stderr logger: `[LEVEL] message`. Level controlled by
-/// RUST_LOG=error|warn|info|debug|trace (default: info).
-struct StderrLogger(log::LevelFilter);
-
-impl log::Log for StderrLogger {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= self.0
-    }
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!("[{:5}] {}", record.level(), record.args());
-        }
-    }
-    fn flush(&self) {}
-}
-
 fn main() -> Result<()> {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(log::LevelFilter::Info);
-    log::set_boxed_logger(Box::new(StderrLogger(level))).unwrap();
-    log::set_max_level(level);
+    fast_nix_common::logging::init();
 
     let args = parse_args()?;
 

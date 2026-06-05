@@ -497,12 +497,7 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
 }
 
 pub fn cli_main() -> Result<()> {
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(log::LevelFilter::Info);
-    log::set_boxed_logger(Box::new(StderrLogger(level))).unwrap();
-    log::set_max_level(level);
+    fast_nix_common::logging::init();
 
     let opts = parse_args()?;
     let dry = opts.dry_run;
@@ -585,19 +580,6 @@ fn parse_args() -> Result<Options> {
         bail!("unexpected arguments: {:?}", rest);
     }
     Ok(opts)
-}
-
-struct StderrLogger(log::LevelFilter);
-impl log::Log for StderrLogger {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= self.0
-    }
-    fn log(&self, r: &log::Record) {
-        if self.enabled(r.metadata()) {
-            eprintln!("[{:5}] {}", r.level(), r.args());
-        }
-    }
-    fn flush(&self) {}
 }
 
 #[cfg(test)]
@@ -736,16 +718,6 @@ mod tests {
         assert!(libc_enospc() > 1);
         assert!(libc_emlink() > 1);
         assert_ne!(libc_enospc(), libc_emlink());
-    }
-
-    #[test]
-    fn logger_respects_level_filter() {
-        use log::Log as _;
-        let logger = StderrLogger(log::LevelFilter::Info);
-        let info = log::Metadata::builder().level(log::Level::Info).build();
-        let debug = log::Metadata::builder().level(log::Level::Debug).build();
-        assert!(logger.enabled(&info));
-        assert!(!logger.enabled(&debug));
     }
 
     const CONTENT: &[u8] = b"hello world hello world hello world\n";

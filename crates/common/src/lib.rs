@@ -1,4 +1,5 @@
 pub mod db;
+pub mod logging;
 
 use anyhow::{Context, Result};
 use std::path::Path;
