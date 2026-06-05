@@ -11,3 +11,6 @@ foldhash.workspace = true
 harmonia-store-core.workspace = true
 nix.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

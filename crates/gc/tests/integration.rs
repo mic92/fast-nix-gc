@@ -237,9 +237,72 @@ fn gc_dry_run_does_not_delete() {
 
     assert!(dead.path.exists() && store.in_db(&dead));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // narSize of "dead" is 500; the estimate must be summed correctly.
     assert!(
-        stdout.contains("1 store paths would be deleted"),
+        stdout.contains("1 store paths would be deleted (~500 bytes)"),
         "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn gc_removes_unlocked_tmp_dir() {
+    let store = TestStore::new();
+
+    let tmp = store.store_dir.join("tmp-build-9999");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("left-over"), "data").unwrap();
+
+    let out = store.run_gc_ok(&[]);
+
+    assert!(!tmp.exists(), "unlocked tmp dir is garbage");
+    // No shared links exist, so no savings line must be logged.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("currently saving"), "stderr: {stderr}");
+}
+
+#[test]
+fn gc_dry_run_counts_unknown_on_disk() {
+    let store = TestStore::new();
+
+    let unknown = store
+        .store_dir
+        .join(format!("{}-unknown", fake_hash("unknown")));
+    fs::create_dir_all(&unknown).unwrap();
+
+    let out = store.run_gc_ok(&["--dry-run"]);
+
+    assert!(unknown.exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 store paths would be deleted (~0 bytes)"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn gc_cleans_unused_links_only_when_not_dry_run() {
+    let store = TestStore::new();
+
+    let links = store.store_dir.join(".links");
+    let dead_link = links.join("deadlink");
+    fs::write(&dead_link, "unreferenced").unwrap();
+    let shared_link = links.join("sharedlink");
+    fs::write(&shared_link, "referenced").unwrap();
+    let pkg = store.add_path("linked", 100);
+    store.add_root("linked-root", &pkg);
+    fs::hard_link(&shared_link, pkg.path.join("shared")).unwrap();
+
+    store.run_gc_ok(&["--dry-run"]);
+    assert!(dead_link.exists(), "dry run must not clean links");
+
+    let out = store.run_gc_ok(&[]);
+    assert!(!dead_link.exists(), "unreferenced link removed");
+    assert!(shared_link.exists(), "referenced link kept");
+    // "referenced" is 10 bytes with nlink 2: savings = (2-1)*10.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("currently saving 10 bytes"),
+        "stderr: {stderr}"
     );
 }
 

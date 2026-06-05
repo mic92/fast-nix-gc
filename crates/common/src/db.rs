@@ -385,3 +385,309 @@ impl StoreGraph {
         alive
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const H2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const H3: &str = "cccccccccccccccccccccccccccccccc";
+
+    struct TestDb {
+        #[allow(dead_code)] // keep tempdir alive
+        dir: tempfile::TempDir,
+        db: NixDb,
+    }
+
+    fn full(name: &str) -> String {
+        format!("/nix/store/{name}")
+    }
+
+    fn setup() -> TestDb {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("db")).unwrap();
+        let conn = Connection::open(state.join("db/db.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ValidPaths (
+                 id integer primary key autoincrement not null,
+                 path text unique not null,
+                 hash text not null,
+                 registrationTime integer not null,
+                 deriver text,
+                 narSize integer
+             );
+             CREATE TABLE Refs (
+                 referrer integer not null,
+                 reference integer not null,
+                 primary key (referrer, reference),
+                 foreign key (reference) references ValidPaths(id) on delete restrict
+             );
+             CREATE TABLE DerivationOutputs (
+                 drv integer not null,
+                 id text not null,
+                 path text not null,
+                 primary key (drv, id)
+             );",
+        )
+        .unwrap();
+        drop(conn);
+        let mut db = NixDb::open(Path::new("/nix/store"), &state).unwrap();
+        // Pin settings; NixDb::open reads them from the host's nix.conf.
+        db.keep_derivations = false;
+        db.keep_outputs = false;
+        TestDb { dir, db }
+    }
+
+    fn add_path(db: &NixDb, name: &str, nar_size: i64, reg_time: i64) -> i64 {
+        db.conn
+            .execute(
+                "INSERT INTO ValidPaths (path, hash, registrationTime, narSize) \
+                 VALUES (?, 'sha256:x', ?, ?)",
+                rusqlite::params![full(name), reg_time, nar_size],
+            )
+            .unwrap();
+        db.conn.last_insert_rowid()
+    }
+
+    fn add_ref(db: &NixDb, referrer: i64, reference: i64) {
+        db.conn
+            .execute(
+                "INSERT INTO Refs (referrer, reference) VALUES (?, ?)",
+                rusqlite::params![referrer, reference],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn has_table_checks_existence() {
+        let t = setup();
+        assert!(NixDb::has_table(&t.db.conn, "ValidPaths").unwrap());
+        assert!(!NixDb::has_table(&t.db.conn, "NoSuchTable").unwrap());
+    }
+
+    #[test]
+    fn load_graph_builds_csr() {
+        let t = setup();
+        let a = add_path(&t.db, &format!("{H1}-a"), 100, 1000);
+        let b = add_path(&t.db, &format!("{H2}-b"), 200, 2000);
+        let c = add_path(&t.db, &format!("{H3}-c"), 300, 3000);
+        // Two edges from one node exercise the CSR cursor advance.
+        add_ref(&t.db, a, b);
+        add_ref(&t.db, a, c);
+
+        let g = t.db.load_graph().unwrap();
+        assert_eq!(g.len(), 3);
+        assert!(!g.is_empty());
+        let ia = g
+            .paths
+            .iter()
+            .position(|p| p == &full(&format!("{H1}-a")))
+            .unwrap();
+        let ib = g
+            .paths
+            .iter()
+            .position(|p| p == &full(&format!("{H2}-b")))
+            .unwrap();
+        let ic = g
+            .paths
+            .iter()
+            .position(|p| p == &full(&format!("{H3}-c")))
+            .unwrap();
+        assert_eq!(g.nar_sizes[ia], 100);
+        assert_eq!(g.registration_times[ic], 3000);
+        let mut refs_a = g.refs(ia as u32).to_vec();
+        refs_a.sort();
+        let mut expected = vec![ib as u32, ic as u32];
+        expected.sort();
+        assert_eq!(refs_a, expected);
+        assert!(g.refs(ib as u32).is_empty());
+        assert!(g.refs(ic as u32).is_empty());
+    }
+
+    #[test]
+    fn empty_graph() {
+        let t = setup();
+        let g = t.db.load_graph().unwrap();
+        assert_eq!(g.len(), 0);
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn store_dir_typed_uses_configured_dir() {
+        let t = setup();
+        // Re-open with a non-default store dir; the typed view must not
+        // fall back to /nix/store.
+        let db = NixDb::open(Path::new("/custom/store"), &t.db.state_dir).unwrap();
+        assert_eq!(db.store_dir_typed().unwrap().to_string(), "/custom/store");
+    }
+
+    #[test]
+    fn load_graph_ignores_edges_with_unknown_ids() {
+        let t = setup();
+        let a = add_path(&t.db, &format!("{H1}-a"), 100, 1000);
+        // Dangling edges must be dropped, not crash or corrupt the CSR.
+        // FK enforcement default varies by SQLite build; this test wants
+        // the corrupt rows.
+        t.db.conn
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        t.db.conn
+            .execute_batch(&format!("INSERT INTO Refs VALUES ({a}, 9999), (9999, {a})"))
+            .unwrap();
+        let g = t.db.load_graph().unwrap();
+        assert!(g.refs(0).is_empty());
+    }
+
+    #[test]
+    fn load_graph_keep_derivations_adds_output_to_drv_edge() {
+        let t = setup();
+        let mut db = t.db;
+        let drv = add_path(&db, &format!("{H1}-pkg.drv"), 10, 1000);
+        let out = add_path(&db, &format!("{H2}-pkg"), 100, 1000);
+        db.conn
+            .execute(
+                "UPDATE ValidPaths SET deriver = ? WHERE id = ?",
+                rusqlite::params![full(&format!("{H1}-pkg.drv")), out],
+            )
+            .unwrap();
+        let _ = drv;
+
+        db.keep_derivations = true;
+        let g = db.load_graph().unwrap();
+        let iout = g.paths.iter().position(|p| p.ends_with("-pkg")).unwrap() as u32;
+        let idrv = g.paths.iter().position(|p| p.ends_with(".drv")).unwrap() as u32;
+        assert_eq!(g.refs(iout), &[idrv]);
+        assert!(g.refs(idrv).is_empty());
+
+        // keep-outputs adds the reverse edge.
+        db.keep_outputs = true;
+        let g = db.load_graph().unwrap();
+        assert_eq!(g.refs(idrv), &[iout]);
+    }
+
+    #[test]
+    fn load_graph_build_trace_edges() {
+        let t = setup();
+        let mut db = t.db;
+        let drv_base = format!("{H1}-pkg.drv");
+        add_path(&db, &drv_base, 10, 1000);
+        add_path(&db, &format!("{H2}-pkg"), 100, 1000);
+        db.conn
+            .execute_batch(&format!(
+                "CREATE TABLE BuildTraceV3 (
+                     id integer primary key autoincrement not null,
+                     drvPath text not null,
+                     outputName text not null,
+                     outputPath text not null,
+                     signatures text
+                 );
+                 INSERT INTO BuildTraceV3 (drvPath, outputName, outputPath)
+                 VALUES ('{drv_base}', 'out', '{}');",
+                full(&format!("{H2}-pkg"))
+            ))
+            .unwrap();
+
+        db.keep_derivations = true;
+        let g = db.load_graph().unwrap();
+        let iout = g.paths.iter().position(|p| p.ends_with("-pkg")).unwrap() as u32;
+        let idrv = g.paths.iter().position(|p| p.ends_with(".drv")).unwrap() as u32;
+        assert_eq!(g.refs(iout), &[idrv]);
+
+        db.keep_derivations = false;
+        db.keep_outputs = true;
+        let g = db.load_graph().unwrap();
+        assert_eq!(g.refs(idrv), &[iout]);
+    }
+
+    #[test]
+    fn valid_paths_and_typed_variants() {
+        let t = setup();
+        add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        add_path(&t.db, &format!("{H2}-b"), 1, 1);
+
+        let mut paths = t.db.valid_paths().unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![full(&format!("{H1}-a")), full(&format!("{H2}-b"))]
+        );
+
+        let sd = t.db.store_dir_typed().unwrap();
+        assert_eq!(sd.to_string(), "/nix/store");
+
+        let sps = t.db.valid_store_paths().unwrap();
+        assert_eq!(sps.len(), 2);
+        let names: Vec<_> = sps.iter().map(|p| p.to_string()).collect();
+        assert!(names.iter().any(|n| n.ends_with("-a")), "{names:?}");
+    }
+
+    #[test]
+    fn is_valid_path_checks_db() {
+        let t = setup();
+        add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        assert!(t.db.is_valid_path(&full(&format!("{H1}-a"))).unwrap());
+        assert!(!t.db.is_valid_path(&full(&format!("{H2}-b"))).unwrap());
+    }
+
+    #[test]
+    fn invalidate_paths_handles_ref_cycles() {
+        let t = setup();
+        let a = add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        let b = add_path(&t.db, &format!("{H2}-b"), 1, 1);
+        add_path(&t.db, &format!("{H3}-c"), 1, 1);
+        // Cycle between the two dead paths; FK on delete restrict would
+        // reject row-by-row deletion.
+        add_ref(&t.db, a, b);
+        add_ref(&t.db, b, a);
+
+        let dead = [full(&format!("{H1}-a")), full(&format!("{H2}-b"))];
+        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
+            .unwrap();
+
+        assert_eq!(t.db.valid_paths().unwrap(), vec![full(&format!("{H3}-c"))]);
+        let refs: i64 =
+            t.db.conn
+                .query_row("SELECT COUNT(*) FROM Refs", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(refs, 0);
+    }
+
+    #[test]
+    fn basename_index_lookups() {
+        let t = setup();
+        add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        add_path(&t.db, &format!("{H2}-b"), 1, 1);
+        add_path(&t.db, &format!("{H3}-c"), 1, 1);
+        let g = t.db.load_graph().unwrap();
+        let bidx = BasenameIndex::new(&g);
+
+        let ic = g.paths.iter().position(|p| p.ends_with("-c")).unwrap() as u32;
+        assert_eq!(bidx.idx_of(&full(&format!("{H3}-c"))), Some(ic));
+        assert_eq!(bidx.idx_of_basename(&format!("{H3}-c")), Some(ic));
+        assert_eq!(bidx.idx_of("/elsewhere/x"), None);
+        assert_eq!(bidx.idx_of_basename("nope"), None);
+    }
+
+    #[test]
+    fn compute_closure_marks_reachable_only() {
+        let t = setup();
+        let a = add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        let b = add_path(&t.db, &format!("{H2}-b"), 1, 1);
+        let c = add_path(&t.db, &format!("{H3}-c"), 1, 1);
+        add_ref(&t.db, a, b);
+        // Cycle must terminate.
+        add_ref(&t.db, b, a);
+        let _ = c;
+
+        let g = t.db.load_graph().unwrap();
+        let ia = g.paths.iter().position(|p| p.ends_with("-a")).unwrap() as u32;
+        let ic = g.paths.iter().position(|p| p.ends_with("-c")).unwrap();
+        // Duplicate roots must not double-visit.
+        let alive = g.compute_closure(&[ia, ia]);
+        assert_eq!(alive.len(), 3);
+        assert_eq!(alive.iter().filter(|&&x| x).count(), 2);
+        assert!(!alive[ic]);
+    }
+}
