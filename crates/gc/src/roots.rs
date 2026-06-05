@@ -115,7 +115,7 @@ fn find_roots_in_dir(
                     // Component match, not substring: "gcroots/automatic"
                     // must not qualify.
                     if dir.ends_with("gcroots/auto") {
-                        log::info!("removing stale link {}", path.display());
+                        log::debug!("removing stale link {}", path.display());
                         fs::remove_file(&path).ok();
                     }
                     continue;
@@ -674,7 +674,7 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
         if let Ok(mut lock) =
             nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
         {
-            log::info!("removing stale temporary roots file {}", path.display());
+            log::debug!("removing stale temporary roots file {}", path.display());
             fs::remove_file(&path).ok();
             // Nix protocol (gc.cc): write "d" after unlinking so a client
             // that re-acquires its fd sees the marker and recreates the
