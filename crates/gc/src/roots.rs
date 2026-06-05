@@ -3,18 +3,21 @@
 
 use crate::HashSet;
 use crate::db::BasenameIndex;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
 /// Find all GC root node indices by walking gcroots/profiles directories
 /// and scanning running processes.
-pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Vec<u32> {
+pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Result<Vec<u32>> {
     let mut roots = HashSet::default();
     let store_prefix = store_dir.to_string_lossy().to_string();
 
+    // Errors here must abort the GC: silently dropping a roots directory
+    // (e.g. EACCES) would let the GC delete live paths.
     for dir in [state_dir.join("gcroots"), state_dir.join("profiles")] {
-        find_roots_in_dir(&dir, &store_prefix, idx, &mut roots);
+        find_roots_in_dir(&dir, &store_prefix, idx, &mut roots)
+            .with_context(|| format!("scanning roots in {}", dir.display()))?;
     }
 
     // Also scan running processes for runtime roots.
@@ -46,7 +49,7 @@ pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Ve
         }
     }
 
-    roots.into_iter().collect()
+    Ok(roots.into_iter().collect())
 }
 
 fn find_roots_in_dir(
@@ -54,23 +57,31 @@ fn find_roots_in_dir(
     store_prefix: &str,
     idx: &BasenameIndex,
     roots: &mut HashSet<u32>,
-) {
+) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        // A missing roots dir contributes no roots; anything else (EACCES,
+        // EIO) hides an unknown number of roots and must fail the GC.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            // Entry removed while scanning (e.g. a stale auto link another
+            // process cleaned up) — not a root anymore.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
         };
 
         if meta.file_type().is_symlink() {
             let target = match fs::read_link(&path) {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("readlink {}", path.display())),
             };
             let target_str = target.to_string_lossy();
 
@@ -116,7 +127,7 @@ fn find_roots_in_dir(
                 }
             }
         } else if meta.file_type().is_dir() {
-            find_roots_in_dir(&path, store_prefix, idx, roots);
+            find_roots_in_dir(&path, store_prefix, idx, roots)?;
         } else if meta.file_type().is_file() {
             // Regular file root (e.g. in auto-roots)
             let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -126,6 +137,7 @@ fn find_roots_in_dir(
             }
         }
     }
+    Ok(())
 }
 
 /// Extract the top-level store path from a potentially deeper path.
@@ -640,7 +652,11 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
         let path = entry.path();
         let f = match fs::OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
-            Err(_) => continue,
+            // Owner exited and the file was cleaned up meanwhile.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Anything else (EACCES, EIO) hides live roots: deleting their
+            // targets would yank paths from under a running builder.
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
         };
 
         // Owner holds a write lock while alive; if we can take it, it's stale.
@@ -651,10 +667,7 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
             continue;
         }
 
-        let contents = match fs::read(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let contents = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
 
         // Each path is NUL-terminated. A trailing run without a NUL is a
         // partial write from a live builder — drop it.

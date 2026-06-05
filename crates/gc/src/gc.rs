@@ -152,7 +152,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     }
 
     log::info!("finding garbage collector roots...");
-    let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx);
+    let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx)?;
 
     // Add temp roots. Some may reference paths registered after our
     // graph snapshot (a builder can register paths while we hold

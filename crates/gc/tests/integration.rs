@@ -946,3 +946,27 @@ fn gc_refuses_store_dir_mismatching_db() {
     );
     assert!(lib.path.exists() && store.in_db(&lib));
 }
+
+#[test]
+fn gc_fails_when_roots_dir_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        // Root bypasses permission checks; cannot simulate EACCES.
+        return;
+    }
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    let sub = store.state_dir.join("gcroots/sub");
+    fs::create_dir_all(&sub).unwrap();
+    std::os::unix::fs::symlink(&lib.path, sub.join("lib-root")).unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = store.run_gc(&[]);
+
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !out.status.success(),
+        "GC must fail closed when a roots dir is unreadable"
+    );
+    assert!(lib.path.exists() && store.in_db(&lib), "live path deleted");
+}
