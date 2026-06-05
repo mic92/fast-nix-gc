@@ -103,9 +103,18 @@ fn find_roots_in_dir(
                 };
                 // metadata() (stat, follows) returns ENOENT for dangling
                 // links and ELOOP for cycles — both are "target gone".
-                if fs::metadata(&abs_target).is_err() {
-                    let auto_dir = dir.to_string_lossy();
-                    if auto_dir.contains("gcroots/auto") {
+                // Any other error (EACCES, EIO) says nothing about the
+                // target's existence: removing the root then would let the
+                // GC delete a live path.
+                if let Err(e) = fs::metadata(&abs_target) {
+                    let target_gone = e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32);
+                    if !target_gone {
+                        return Err(e).with_context(|| format!("stat {}", abs_target.display()));
+                    }
+                    // Component match, not substring: "gcroots/automatic"
+                    // must not qualify.
+                    if dir.ends_with("gcroots/auto") {
                         log::info!("removing stale link {}", path.display());
                         fs::remove_file(&path).ok();
                     }

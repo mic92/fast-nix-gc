@@ -970,3 +970,48 @@ fn gc_fails_when_roots_dir_is_unreadable() {
     );
     assert!(lib.path.exists() && store.in_db(&lib), "live path deleted");
 }
+
+#[test]
+fn gc_keeps_auto_root_with_unreadable_target() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        return; // root bypasses permission checks
+    }
+    // An EACCES on the indirect target says nothing about its existence;
+    // the auto link must survive and the GC must fail closed.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    let auto = store.state_dir.join("gcroots/auto");
+    fs::create_dir_all(&auto).unwrap();
+    let private = store.dir.path().join("private");
+    fs::create_dir_all(&private).unwrap();
+    let user_link = private.join("result");
+    std::os::unix::fs::symlink(&lib.path, &user_link).unwrap();
+    std::os::unix::fs::symlink(&user_link, auto.join("x0")).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = store.run_gc(&[]);
+
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!out.status.success(), "GC must fail closed");
+    assert!(
+        auto.join("x0").symlink_metadata().is_ok(),
+        "auto root removed"
+    );
+    assert!(lib.path.exists());
+}
+
+#[test]
+fn gc_removes_dangling_auto_root() {
+    let store = TestStore::new();
+    let auto = store.state_dir.join("gcroots/auto");
+    fs::create_dir_all(&auto).unwrap();
+    std::os::unix::fs::symlink(store.dir.path().join("gone"), auto.join("x1")).unwrap();
+
+    store.run_gc_ok(&[]);
+
+    assert!(
+        auto.join("x1").symlink_metadata().is_err(),
+        "dangling auto root must be removed"
+    );
+}
