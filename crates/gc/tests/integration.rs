@@ -122,6 +122,34 @@ impl TestStore {
             .unwrap();
     }
 
+    /// Insert a BuildTraceV3 row (Nix ≥2.35 schema: drvPath is a store
+    /// path basename, outputPath is a full store path).
+    fn add_build_trace(&self, drv: &Pkg, output_name: &str, out: &Pkg) {
+        let conn = self.db();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS BuildTraceV3 (
+                id integer primary key autoincrement not null,
+                drvPath text not null,
+                outputName text not null,
+                outputPath text not null,
+                signatures text
+            );
+            CREATE INDEX IF NOT EXISTS IndexBuildTraceV3 ON BuildTraceV3(drvPath, outputName);",
+        )
+        .unwrap();
+        // drvPath is a basename (no store dir prefix), matching Nix's
+        // DrvOutput::to_string() which skips the store dir.
+        let drv_basename = drv
+            .full
+            .strip_prefix(&format!("{}/", self.store_dir.display()))
+            .unwrap_or(&drv.full);
+        conn.execute(
+            "INSERT INTO BuildTraceV3 (drvPath, outputName, outputPath) VALUES (?, ?, ?)",
+            rusqlite::params![drv_basename, output_name, out.full],
+        )
+        .unwrap();
+    }
+
     fn add_root(&self, root_name: &str, target: &Pkg) {
         let link = self.state_dir.join("gcroots").join(root_name);
         std::os::unix::fs::symlink(&target.path, &link).unwrap();
@@ -157,6 +185,11 @@ impl TestStore {
             String::from_utf8_lossy(&out.stderr)
         );
         out
+    }
+
+    /// Run GC with keep-outputs enabled via CLI flag.
+    fn run_gc_keep_outputs_ok(&self) -> std::process::Output {
+        self.run_gc_ok(&["--keep-outputs", "true"])
     }
 }
 
@@ -602,9 +635,9 @@ fn gc_keeps_ca_outputs_of_alive_drv() {
     store.add_root("drv-root", &drv);
     let trash = store.add_path("trash", 100);
 
-    store.run_gc_ok(&[]);
+    store.run_gc_keep_outputs_ok();
 
-    // keep-derivations: alive .drv keeps its outputs alive.
+    // keep-outputs: alive .drv keeps its outputs alive.
     assert!(drv.path.exists(), "drv deleted");
     assert!(out.path.exists(), "CA output deleted despite alive drv");
     assert!(!trash.path.exists());
@@ -696,4 +729,48 @@ fn gc_empty_store_is_noop() {
     let out = store.run_gc_ok(&[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("0 store paths deleted"), "stdout: {stdout}");
+}
+
+#[test]
+fn gc_keeps_ca_output_via_build_trace() {
+    // Dynamic / CA derivation: BuildTraceV3 maps drv→output.
+    // With keep-outputs, alive drv keeps its CA output via BuildTraceV3.
+    let store = TestStore::new();
+
+    let drv = store.add_path("dyn-pkg.drv", 50);
+    let out = store.add_path("dyn-pkg-out", 200);
+    // No DerivationOutputs entry — only BuildTraceV3.
+    store.add_build_trace(&drv, "out", &out);
+    store.add_root("drv-root", &drv);
+    let trash = store.add_path("trash", 100);
+
+    store.run_gc_keep_outputs_ok();
+
+    assert!(drv.path.exists(), "drv deleted");
+    assert!(
+        out.path.exists(),
+        "CA output deleted despite alive drv (BuildTraceV3)"
+    );
+    assert!(!trash.path.exists());
+}
+
+#[test]
+fn gc_keeps_ca_deriver_via_build_trace() {
+    // Alive CA output should keep its drv alive via BuildTraceV3.
+    let store = TestStore::new();
+
+    let drv = store.add_path("dyn-pkg.drv", 50);
+    let out = store.add_path("dyn-pkg-out", 200);
+    store.add_build_trace(&drv, "out", &out);
+    store.add_root("out-root", &out);
+    let trash = store.add_path("trash", 100);
+
+    store.run_gc_ok(&[]);
+
+    assert!(out.path.exists(), "output deleted");
+    assert!(
+        drv.path.exists(),
+        "CA deriver deleted despite alive output (BuildTraceV3)"
+    );
+    assert!(!trash.path.exists());
 }

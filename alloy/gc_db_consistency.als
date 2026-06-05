@@ -36,6 +36,11 @@ module gc_db_consistency
 -- Static structure
 ----------------------------------------------------------------------------
 
+-- `refs` abstracts every edge type load_graph() puts into the CSR graph:
+-- the Refs table, plus (under keep-derivations / keep-outputs) the
+-- drv↔output edges from ValidPaths.deriver, DerivationOutputs and
+-- BuildTraceV3. All of these are built with JOINs against ValidPaths, so
+-- both endpoints are always in the snapshot (staticStore below).
 sig Path { refs: set Path }
 
 -- Paths present in the DB when load_graph() took its snapshot.

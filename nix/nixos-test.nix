@@ -13,6 +13,9 @@ pkgs.testers.runNixOSTest {
         keepRecent = "1h";
       };
       services.fast-nix-optimise.enable = true;
+      # The CA test phases root a .drv and expect its output to survive,
+      # which requires keep-outputs (mirrors nix-store --gc semantics).
+      nix.settings.keep-outputs = true;
       # nix-store --optimise (and ours) cannot rename hardlinks across an
       # overlayfs lower/upper boundary: ESTALE on the 9p host store. A
       # store image avoids that, but the overlay upper is still tmpfs and
@@ -21,6 +24,9 @@ pkgs.testers.runNixOSTest {
       virtualisation.useNixStoreImage = true;
       virtualisation.writableStore = true;
       virtualisation.memorySize = 2048;
+      # nix from git for the BuildTraceV3 test phase; referenced by store
+      # path in the test script, so it must be in the VM's closure.
+      virtualisation.additionalPaths = [ pkgs.nixVersions.git ];
       environment.systemPackages = [
         pkgs.hello
         pkgs.sqlite
@@ -31,6 +37,120 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     machine.start()
     machine.wait_for_unit("multi-user.target")
+
+    # --- CA derivations: realisation tables must keep drv↔output alive ---
+    # Build a CA derivation directly in the system store.
+    ca_drv_expr = (
+        'derivation { '
+        'name = "ca-test"; system = "${pkgs.system}"; '
+        'builder = "/bin/sh"; args = ["-c" "echo hello > $out"]; '
+        '__contentAddressed = true; outputHashMode = "recursive"; '
+        'outputHashAlgo = "sha256"; }'
+    )
+    ca_out = machine.succeed(
+        "nix-build"
+        ' --option experimental-features "nix-command ca-derivations"'
+        " --no-out-link"
+        f" -E '{ca_drv_expr}'"
+    ).strip()
+    ca_db = "/nix/var/nix/db/db.sqlite"
+
+    ca_drv = machine.succeed(
+        f"sqlite3 {ca_db} "
+        f"\"SELECT path FROM ValidPaths WHERE path LIKE '%ca-test.drv'\""
+    ).strip()
+    assert ca_drv, "drv not found in DB"
+
+    # Verify a CA realisation table was populated (Realisations or BuildTraceV3).
+    real_count = machine.succeed(
+        f"sqlite3 {ca_db} "
+        "\"SELECT COUNT(*) FROM (SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name IN ('Realisations','BuildTraceV3'))\""
+    ).strip()
+    assert int(real_count) > 0, "no CA realisation table found"
+
+    # Backdate both so --keep-recent doesn't pin them.
+    machine.succeed(
+        f"sqlite3 {ca_db} "
+        f"\"UPDATE ValidPaths SET registrationTime = 1 "
+        f"WHERE path IN ('{ca_drv}', '{ca_out}')\""
+    )
+
+    # Root the output only; drv should survive via realisation edges.
+    machine.succeed(f"nix-store --add-root /tmp/ca-out-root --indirect -r {ca_out}")
+    machine.succeed("systemctl start fast-nix-gc.service")
+    machine.succeed(f"test -e {ca_out}")
+    machine.succeed(f"test -e {ca_drv}")
+
+    # Now root only the drv; output should survive.
+    machine.succeed(
+        "rm /tmp/ca-out-root",
+        f"ln -sf {ca_drv} /nix/var/nix/gcroots/ca-drv-root",
+    )
+    machine.succeed("systemctl start fast-nix-gc.service")
+    machine.succeed(f"test -e {ca_drv}")
+    machine.succeed(f"test -e {ca_out}")
+    machine.succeed("rm -f /nix/var/nix/gcroots/ca-drv-root")
+
+    # --- BuildTraceV3 (nix from git / unreleased) ---
+    # Use nix-from-git to build a second CA derivation; it populates
+    # BuildTraceV3 instead of Realisations.
+    machine.succeed(
+        "cat > /tmp/ca-test2.nix <<'EOF'\n"
+        "derivation {\n"
+        '  name = "ca-test2";\n'
+        '  system = "${pkgs.system}";\n'
+        '  builder = "/bin/sh";\n'
+        '  args = ["-c" "echo hello2 > $out"];\n'
+        "  __contentAddressed = true;\n"
+        '  outputHashMode = "recursive";\n'
+        '  outputHashAlgo = "sha256";\n'
+        "}\nEOF"
+    )
+    # Use --store local to bypass the system daemon (which is Nix 2.34
+    # and would populate Realisations instead of BuildTraceV3).
+    ca_out2 = machine.succeed(
+        "${pkgs.nixVersions.git}/bin/nix-build --store local"
+        ' --option experimental-features "nix-command ca-derivations"'
+        " --no-out-link /tmp/ca-test2.nix"
+    ).strip()
+
+    ca_drv2 = machine.succeed(
+        f"sqlite3 {ca_db} "
+        f"\"SELECT path FROM ValidPaths WHERE path LIKE '%ca-test2.drv'\""
+    ).strip()
+    assert ca_drv2, "ca-test2 drv not found in DB"
+
+    # Verify BuildTraceV3 was populated.
+    # BuildTraceV3.drvPath stores the basename (no /nix/store/ prefix).
+    ca_drv2_base = ca_drv2.split("/")[-1]
+    bt_count = int(machine.succeed(
+        f"sqlite3 {ca_db} "
+        f"\"SELECT COUNT(*) FROM BuildTraceV3 WHERE drvPath = '{ca_drv2_base}'\""
+    ).strip())
+    assert bt_count > 0, f"BuildTraceV3 has no entry for {ca_drv2_base}"
+
+    machine.succeed(
+        f"sqlite3 {ca_db} "
+        f"\"UPDATE ValidPaths SET registrationTime = 1 "
+        f"WHERE path IN ('{ca_drv2}', '{ca_out2}')\""
+    )
+
+    # Root output; drv should survive via BuildTraceV3.
+    machine.succeed(f"ln -sf {ca_out2} /nix/var/nix/gcroots/ca-out2-root")
+    machine.succeed("systemctl start fast-nix-gc.service")
+    machine.succeed(f"test -e {ca_out2}")
+    machine.succeed(f"test -e {ca_drv2}")
+
+    # Root drv; output should survive via BuildTraceV3.
+    machine.succeed(
+        "rm /nix/var/nix/gcroots/ca-out2-root",
+        f"ln -sf {ca_drv2} /nix/var/nix/gcroots/ca-drv2-root",
+    )
+    machine.succeed("systemctl start fast-nix-gc.service")
+    machine.succeed(f"test -e {ca_drv2}")
+    machine.succeed(f"test -e {ca_out2}")
+    machine.succeed("rm -f /nix/var/nix/gcroots/ca-drv2-root")
 
     # Create a dead store path: add a file with no roots.
     machine.succeed("echo gc-victim > /tmp/gc-dead")

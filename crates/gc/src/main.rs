@@ -10,6 +10,8 @@ struct Args {
     dry_run: bool,
     ensure_free: Option<u64>,
     keep_recent: Option<String>,
+    keep_outputs: Option<bool>,
+    keep_derivations: Option<bool>,
     store_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -48,6 +50,8 @@ fn parse_args() -> Result<Args> {
         eprintln!("      --dry-run                 Show what would be done");
         eprintln!("      --ensure-free SIZE           Free until SIZE is available (e.g. 50G)");
         eprintln!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
+        eprintln!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
+        eprintln!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
         eprintln!("      --store-dir PATH          Nix store directory [default: /nix/store]");
         eprintln!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
         std::process::exit(0);
@@ -63,6 +67,8 @@ fn parse_args() -> Result<Args> {
         dry_run: pargs.contains("--dry-run"),
         ensure_free: pargs.opt_value_from_fn("--ensure-free", parse_size)?,
         keep_recent: pargs.opt_value_from_str("--keep-recent")?,
+        keep_outputs: pargs.opt_value_from_str("--keep-outputs")?,
+        keep_derivations: pargs.opt_value_from_str("--keep-derivations")?,
         store_dir: pargs
             .opt_value_from_str("--store-dir")?
             .unwrap_or_else(|| PathBuf::from("/nix/store")),
@@ -147,7 +153,13 @@ fn main() -> Result<()> {
                 .unwrap_or(0)
         });
 
-    let store = db::NixDb::open(&args.store_dir, &args.state_dir)?;
+    let mut store = db::NixDb::open(&args.store_dir, &args.state_dir)?;
+    if let Some(v) = args.keep_outputs {
+        store.keep_outputs = v;
+    }
+    if let Some(v) = args.keep_derivations {
+        store.keep_derivations = v;
+    }
     let opts = gc::GcOptions {
         dry_run: args.dry_run,
         max_freed,
