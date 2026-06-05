@@ -39,7 +39,11 @@ fn available_bytes(path: &Path) -> Result<u64> {
 }
 
 fn parse_args() -> Result<Args> {
-    let mut pargs = pico_args::Arguments::from_env();
+    parse_args_from(std::env::args_os().skip(1).collect())
+}
+
+fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
+    let mut pargs = pico_args::Arguments::from_vec(args);
 
     if pargs.contains("--help") {
         eprintln!("Usage: fast-nix-gc [OPTIONS]");
@@ -61,7 +65,7 @@ fn parse_args() -> Result<Args> {
     let delete_old =
         pargs.contains("-d") || pargs.contains("--delete-old") || delete_older_than.is_some();
 
-    Ok(Args {
+    let args = Args {
         delete_old,
         delete_older_than,
         dry_run: pargs.contains("--dry-run"),
@@ -75,7 +79,13 @@ fn parse_args() -> Result<Args> {
         state_dir: pargs
             .opt_value_from_str("--state-dir")?
             .unwrap_or_else(|| PathBuf::from("/nix/var/nix")),
-    })
+    };
+    // A typo'd flag (e.g. --dry-rnu) must not silently run a destructive GC.
+    let rest = pargs.finish();
+    if !rest.is_empty() {
+        bail!("unexpected arguments: {rest:?}");
+    }
+    Ok(args)
 }
 
 /// Minimal stderr logger: `[LEVEL] message`. Level controlled by
@@ -184,7 +194,19 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::{parse_args_from, parse_size};
+
+    fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
+        list.iter().map(|s| s.into()).collect()
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_arguments() {
+        assert!(parse_args_from(args(&["--dry-rnu"])).is_err());
+        assert!(parse_args_from(args(&["--dry-run", "extra"])).is_err());
+        let parsed = parse_args_from(args(&["--dry-run"])).unwrap();
+        assert!(parsed.dry_run);
+    }
 
     #[test]
     fn parse_size_units() {
