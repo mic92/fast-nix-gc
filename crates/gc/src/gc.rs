@@ -5,6 +5,7 @@ use crate::gc_socket::{GcSocketServer, LiveSet};
 use crate::roots::{find_roots, find_temp_roots};
 use crate::{format_size, make_store_writable};
 use anyhow::{Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use rayon::prelude::*;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -66,8 +67,6 @@ fn delete_store_path(real_path: &Path) -> Result<u64> {
 
     Ok(bytes_freed)
 }
-
-use nix::fcntl::{Flock, FlockArg};
 
 /// Lock a `tmp-*` build dir before deleting. None means a builder still
 /// holds it. Caller keeps the fd through deletion to avoid a TOCTOU race.
