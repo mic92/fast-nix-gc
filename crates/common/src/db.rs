@@ -62,12 +62,17 @@ impl NixDb {
         // after a grace period, like Nix's busy handler.
         conn.busy_timeout(std::time::Duration::from_secs(60))?;
 
+        // Like Nix's realStoreDir: the physical directory when store_dir
+        // is a symlink (the DB keeps logical paths, disk ops want real
+        // ones). Falls back to the logical dir if it can't be resolved.
+        let real_store_dir =
+            std::fs::canonicalize(store_dir).unwrap_or_else(|_| store_dir.to_path_buf());
         Ok(NixDb {
             conn,
             store_dir: store_dir.to_path_buf(),
             state_dir: state_dir.to_path_buf(),
-            real_store_dir: store_dir.to_path_buf(),
-            links_dir: store_dir.join(".links"),
+            links_dir: real_store_dir.join(".links"),
+            real_store_dir,
             // Read the resolved nix.conf via `nix config show`; defaults
             // match Nix if it's not in PATH.
             keep_derivations: crate::nix_config::bool_setting("keep-derivations", true),
