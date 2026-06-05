@@ -669,10 +669,18 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
         };
 
         // Owner holds a write lock while alive; if we can take it, it's stale.
-        if let Ok(_lock) = nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        if let Ok(mut lock) =
+            nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        {
             log::info!("removing stale temporary roots file {}", path.display());
             fs::remove_file(&path).ok();
-            // _lock dropped here, releasing flock after unlink
+            // Nix protocol (gc.cc): write "d" after unlinking so a client
+            // that re-acquires its fd sees the marker and recreates the
+            // file instead of writing roots into an unlinked inode the GC
+            // will never read.
+            use std::io::Write;
+            let _ = lock.write_all(b"d");
+            // lock dropped here, releasing flock after unlink
             continue;
         }
 
@@ -791,11 +799,23 @@ mod tests {
         fs::write(dir.join(".keep"), b"junk").unwrap();
         fs::write(dir.join("notapid"), format!("/nix/store/{HASH}-junk\0")).unwrap();
 
+        // Keep an fd on the stale file to observe the "d" marker.
+        let stale_fd = fs::File::open(&stale).unwrap();
+
         let roots = find_temp_roots(tmp.path()).unwrap();
         assert!(roots.contains(&sp1));
         assert!(roots.contains(&sp2));
         assert_eq!(roots.len(), 2, "{roots:?}");
         assert!(!stale.exists(), "stale temp roots file removed");
+        // Nix clients detect deletion by reading back a "d" marker.
+        {
+            use std::io::{Read, Seek};
+            let mut f = stale_fd;
+            f.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"d", "missing deletion marker");
+        }
         assert!(dir.join(".keep").exists());
         assert!(dir.join("notapid").exists());
     }
