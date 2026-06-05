@@ -191,20 +191,27 @@ pub fn remove_old_generations(
     Ok(())
 }
 
+/// Directories scanned for profiles, mirroring nix-collect-garbage:
+/// the system profiles dir (recursed, so per-user is covered) and the
+/// invoking user's XDG state profiles dir. Never the home directory
+/// itself — remove_old_generations recurses, and treating arbitrary
+/// `*-N-link` symlinks under $HOME as generations would delete user data.
 pub fn profile_dirs(state_dir: &Path) -> BTreeSet<PathBuf> {
     let mut dirs = BTreeSet::new();
 
-    if let Ok(user) = std::env::var("USER") {
-        dirs.insert(state_dir.join("profiles/per-user").join(&user));
-    }
-
     dirs.insert(state_dir.join("profiles"));
 
-    if let Ok(home) = std::env::var("HOME") {
-        let default_profile = PathBuf::from(&home).join(".nix-profile");
-        if let Some(parent) = default_profile.parent() {
-            dirs.insert(parent.to_path_buf());
-        }
+    let xdg_state = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        });
+    if let Some(state_home) = xdg_state {
+        dirs.insert(state_home.join("nix/profiles"));
     }
 
     dirs
@@ -375,15 +382,16 @@ mod tests {
     }
 
     #[test]
-    fn profile_dirs_includes_state_and_user_paths() {
+    fn profile_dirs_includes_state_and_xdg_paths_but_not_home() {
         let state = Path::new("/var/state");
         let dirs = profile_dirs(state);
         assert!(dirs.contains(&state.join("profiles")));
-        if let Ok(user) = std::env::var("USER") {
-            assert!(dirs.contains(&state.join("profiles/per-user").join(user)));
-        }
         if let Ok(home) = std::env::var("HOME") {
-            assert!(dirs.contains(&PathBuf::from(home)));
+            // $HOME itself must never be scanned recursively.
+            assert!(!dirs.contains(&PathBuf::from(&home)));
+            if std::env::var("XDG_STATE_HOME").is_err() {
+                assert!(dirs.contains(&PathBuf::from(home).join(".local/state/nix/profiles")));
+            }
         }
     }
 
