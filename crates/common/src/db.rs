@@ -39,6 +39,14 @@ impl NixDb {
 
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Nix's schema relies on FK actions (DerivationOutputs/Refs rows
+        // cascade when a ValidPaths row goes away), but SQLite only honors
+        // them with the pragma on. Without it every invalidation leaks
+        // orphaned DerivationOutputs rows.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        // nix-daemon may hold short write locks; fail with SQLITE_BUSY only
+        // after a grace period, like Nix's busy handler.
+        conn.busy_timeout(std::time::Duration::from_secs(60))?;
 
         Ok(NixDb {
             conn,
@@ -288,6 +296,22 @@ impl NixDb {
                 "DELETE FROM Refs WHERE referrer IN (SELECT id FROM DeadPaths) \
                  OR reference IN (SELECT id FROM DeadPaths)",
             )?;
+            // Same for the CA realisations of Nix ≤2.34:
+            // RealisationsRefs.realisationReference is ON DELETE RESTRICT,
+            // and our bulk DELETE is unordered (Nix avoids the constraint
+            // by deleting one path at a time in topological order).
+            if Self::has_table(&self.conn, "Realisations")? {
+                self.conn.execute_batch(
+                    "DELETE FROM RealisationsRefs WHERE referrer IN \
+                         (SELECT id FROM Realisations WHERE outputPath IN \
+                             (SELECT id FROM DeadPaths)) \
+                     OR realisationReference IN \
+                         (SELECT id FROM Realisations WHERE outputPath IN \
+                             (SELECT id FROM DeadPaths)); \
+                     DELETE FROM Realisations WHERE outputPath IN \
+                         (SELECT id FROM DeadPaths)",
+                )?;
+            }
             self.conn
                 .execute_batch("DELETE FROM ValidPaths WHERE id IN (SELECT id FROM DeadPaths)")?;
             Ok(())
@@ -444,7 +468,8 @@ mod tests {
                  drv integer not null,
                  id text not null,
                  path text not null,
-                 primary key (drv, id)
+                 primary key (drv, id),
+                 foreign key (drv) references ValidPaths(id) on delete cascade
              );",
         )
         .unwrap();
@@ -668,6 +693,76 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM Refs", [], |r| r.get(0))
                 .unwrap();
         assert_eq!(refs, 0);
+    }
+
+    #[test]
+    fn invalidate_paths_cascades_derivation_outputs() {
+        let t = setup();
+        let drv = add_path(&t.db, &format!("{H1}-pkg.drv"), 1, 1);
+        let out = add_path(&t.db, &format!("{H2}-pkg"), 1, 1);
+        t.db.conn
+            .execute(
+                "INSERT INTO DerivationOutputs (drv, id, path) VALUES (?, 'out', ?)",
+                rusqlite::params![drv, full(&format!("{H2}-pkg"))],
+            )
+            .unwrap();
+        let _ = out;
+
+        let dead = [full(&format!("{H1}-pkg.drv"))];
+        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
+            .unwrap();
+
+        let n: i64 =
+            t.db.conn
+                .query_row("SELECT COUNT(*) FROM DerivationOutputs", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(n, 0, "DerivationOutputs row orphaned");
+    }
+
+    #[test]
+    fn invalidate_paths_clears_realisations_with_restrict_fk() {
+        // Nix ≤2.34 CA schema: RealisationsRefs.realisationReference is ON
+        // DELETE RESTRICT. Bulk-deleting two dead paths whose realisations
+        // reference each other must not trip the constraint.
+        let t = setup();
+        t.db.conn
+            .execute_batch(
+                "CREATE TABLE Realisations (
+                     id integer primary key autoincrement not null,
+                     drvPath text not null,
+                     outputName text not null,
+                     outputPath integer not null references ValidPaths(id) on delete cascade,
+                     signatures text
+                 );
+                 CREATE TABLE RealisationsRefs (
+                     referrer integer not null,
+                     realisationReference integer,
+                     foreign key (referrer) references Realisations(id) on delete cascade,
+                     foreign key (realisationReference) references Realisations(id) on delete restrict
+                 );",
+            )
+            .unwrap();
+        let a = add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        let b = add_path(&t.db, &format!("{H2}-b"), 1, 1);
+        t.db.conn
+            .execute_batch(&format!(
+                "INSERT INTO Realisations (drvPath, outputName, outputPath) \
+                     VALUES ('sha256:a!out', 'out', {a}), ('sha256:b!out', 'out', {b});
+                 INSERT INTO RealisationsRefs (referrer, realisationReference) VALUES (1, 2);"
+            ))
+            .unwrap();
+
+        let dead = [full(&format!("{H1}-a")), full(&format!("{H2}-b"))];
+        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
+            .unwrap();
+
+        for table in ["Realisations", "RealisationsRefs", "ValidPaths"] {
+            let n: i64 =
+                t.db.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+            assert_eq!(n, 0, "{table} not cleared");
+        }
     }
 
     #[test]
