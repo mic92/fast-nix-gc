@@ -623,6 +623,232 @@ mod tests {
         rusqlite::Connection::open(p).unwrap()
     }
 
+    fn mk_store_path(store: &Path, name: &str, content: &[u8]) -> PathBuf {
+        let p = store.join(name);
+        fs::create_dir_all(&p).unwrap();
+        let f = p.join("data");
+        fs::write(&f, content).unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o555)).unwrap();
+        p
+    }
+
+    fn mk_db(state: &Path, paths: &[&Path]) {
+        fs::create_dir_all(state.join("db")).unwrap();
+        let conn = rusqlite_open(&state.join("db/db.sqlite"));
+        conn.execute_batch("CREATE TABLE ValidPaths (id INTEGER PRIMARY KEY, path TEXT NOT NULL);")
+            .unwrap();
+        for p in paths {
+            conn.execute(
+                "INSERT INTO ValidPaths (path) VALUES (?)",
+                [p.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+    }
+
+    fn unlock(p: &Path) {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_opts(store: &Path, state: &Path) -> Options {
+        Options {
+            store_dir: store.to_path_buf(),
+            state_dir: state.to_path_buf(),
+            jobs: 1,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn load_link_inodes_missing_dir_is_empty() {
+        let tmp = tempdir().unwrap();
+        let set = load_link_inodes(&tmp.path().join("nope")).unwrap();
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn load_link_inodes_returns_actual_inodes() {
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        fs::write(&a, b"x").unwrap();
+        fs::write(&b, b"y").unwrap();
+        let set = load_link_inodes(tmp.path()).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&fs::metadata(&a).unwrap().ino()));
+        assert!(set.contains(&fs::metadata(&b).unwrap().ino()));
+    }
+
+    #[test]
+    fn rand_suffix_is_unique_per_call() {
+        assert_ne!(rand_suffix(), rand_suffix());
+    }
+
+    #[test]
+    fn errno_helpers_match_libc_values() {
+        assert_eq!(libc_enospc(), nix::errno::Errno::ENOSPC as i32);
+        assert_eq!(libc_emlink(), nix::errno::Errno::EMLINK as i32);
+        assert!(libc_enospc() > 1);
+        assert!(libc_emlink() > 1);
+        assert_ne!(libc_enospc(), libc_emlink());
+    }
+
+    #[test]
+    fn logger_respects_level_filter() {
+        use log::Log as _;
+        let logger = StderrLogger(log::LevelFilter::Info);
+        let info = log::Metadata::builder().level(log::Level::Info).build();
+        let debug = log::Metadata::builder().level(log::Level::Debug).build();
+        assert!(logger.enabled(&info));
+        assert!(!logger.enabled(&debug));
+    }
+
+    const CONTENT: &[u8] = b"hello world hello world hello world\n";
+
+    async fn run_two_identical(
+        min_size: u64,
+        dry_run: bool,
+    ) -> (Stats, PathBuf, PathBuf, tempfile::TempDir) {
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let p1 = mk_store_path(&store, "cccccccccccccccccccccccccccccccc-c", CONTENT);
+        let p2 = mk_store_path(&store, "dddddddddddddddddddddddddddddddd-d", CONTENT);
+        mk_db(&state, &[&p1, &p2]);
+        let stats = optimise_store(Options {
+            min_size,
+            dry_run,
+            ..run_opts(&store, &state)
+        })
+        .await
+        .unwrap();
+        unlock(&p1);
+        unlock(&p2);
+        (stats, p1.join("data"), p2.join("data"), tmp)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn min_size_equal_to_len_is_processed() {
+        let (stats, f1, f2, _tmp) = run_two_identical(CONTENT.len() as u64, false).await;
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.files_skipped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fs::metadata(&f1).unwrap().ino(),
+            fs::metadata(&f2).unwrap().ino()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn min_size_above_len_is_skipped() {
+        let (stats, f1, f2, _tmp) = run_two_identical(CONTENT.len() as u64 + 1, false).await;
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.files_skipped.load(Ordering::Relaxed), 2);
+        assert_ne!(
+            fs::metadata(&f1).unwrap().ino(),
+            fs::metadata(&f2).unwrap().ino()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dry_run_counts_but_does_not_link() {
+        let (stats, f1, f2, _tmp) = run_two_identical(0, true).await;
+        // .links is empty in dry-run, so both files count as linkable.
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            stats.bytes_freed.load(Ordering::Relaxed),
+            2 * CONTENT.len() as u64
+        );
+        assert_ne!(
+            fs::metadata(&f1).unwrap().ino(),
+            fs::metadata(&f2).unwrap().ino()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restores_parent_perms_and_mtime() {
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let p1 = mk_store_path(&store, "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk-k", CONTENT);
+        let p2 = mk_store_path(&store, "ffffffffffffffffffffffffffffffff-f", CONTENT);
+        mk_db(&state, &[&p1, &p2]);
+        let stats = optimise_store(run_opts(&store, &state)).await.unwrap();
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 1);
+        // Exactly one dir had its file replaced; that dir must be restored
+        // to mode 0555 with mtime 1.
+        let restored: Vec<_> = [&p1, &p2]
+            .into_iter()
+            .map(|p| fs::metadata(p).unwrap())
+            .filter(|m| m.mtime() == 1)
+            .collect();
+        assert_eq!(restored.len(), 1, "one parent dir restored to mtime 1");
+        assert_eq!(restored[0].permissions().mode() & 0o777, 0o555);
+        unlock(&p1);
+        unlock(&p2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_link_with_size_mismatch_is_skipped() {
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let p1 = mk_store_path(&store, "gggggggggggggggggggggggggggggggg-g", CONTENT);
+        mk_db(&state, &[&p1]);
+        // Pre-create a corrupt .links entry under the file's hash with a
+        // different size.
+        let hash = nar_hash_nix32(&p1.join("data")).await.unwrap();
+        let links = store.join(".links");
+        fs::create_dir_all(&links).unwrap();
+        fs::write(links.join(&hash), b"wrong size").unwrap();
+
+        let stats = optimise_store(run_opts(&store, &state)).await.unwrap();
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 0);
+        assert_ne!(
+            fs::metadata(p1.join("data")).unwrap().ino(),
+            fs::metadata(links.join(&hash)).unwrap().ino()
+        );
+        unlock(&p1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_file_is_not_counted_as_linked() {
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let p1 = mk_store_path(&store, "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-h", CONTENT);
+        mk_db(&state, &[&p1]);
+        let stats = optimise_store(run_opts(&store, &state)).await.unwrap();
+        // Sole file becomes the canonical .links entry (same inode);
+        // nothing is replaced, so the counter must stay 0.
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 0);
+        assert_eq!(store.join(".links").read_dir().unwrap().count(), 1);
+        unlock(&p1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writable_file_is_skipped_as_suspicious() {
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let p1 = mk_store_path(&store, "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-i", CONTENT);
+        let p2 = mk_store_path(&store, "jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj-j", CONTENT);
+        unlock(&p2);
+        fs::set_permissions(p2.join("data"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&p2, fs::Permissions::from_mode(0o555)).unwrap();
+        mk_db(&state, &[&p1, &p2]);
+        let stats = optimise_store(run_opts(&store, &state)).await.unwrap();
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.files_skipped.load(Ordering::Relaxed), 1);
+        unlock(&p1);
+        unlock(&p2);
+    }
+
     #[test]
     fn shared_gc_lock_blocks_exclusive() {
         use nix::fcntl::{Flock, FlockArg};
