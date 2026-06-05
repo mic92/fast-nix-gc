@@ -40,11 +40,28 @@ fn fake_hash(name: &str) -> String {
 
 impl TestStore {
     fn new() -> Self {
+        Self::new_inner(false)
+    }
+
+    /// Store dir is a symlink to the real directory, like /nix/store on
+    /// installs with a relocated store. The kernel reports canonical
+    /// paths for fds, the DB stores logical ones.
+    fn new_symlinked() -> Self {
+        Self::new_inner(true)
+    }
+
+    fn new_inner(symlink_store: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("store");
         let state_dir = dir.path().join("state");
 
-        fs::create_dir_all(&store_dir).unwrap();
+        if symlink_store {
+            let real = dir.path().join("store-real");
+            fs::create_dir_all(&real).unwrap();
+            std::os::unix::fs::symlink(&real, &store_dir).unwrap();
+        } else {
+            fs::create_dir_all(&store_dir).unwrap();
+        }
         for d in ["db", "gcroots", "profiles", "temproots"] {
             fs::create_dir_all(state_dir.join(d)).unwrap();
         }
@@ -461,6 +478,51 @@ fn gc_keeps_runtime_roots_from_open_fd() {
     // Inherit an fd into the child so the path shows up in the GC's
     // own /proc/<pid>/fd. Sandboxes can't always inspect other PIDs.
     let f = fs::File::open(held.path.join("file")).unwrap();
+    let raw_fd = f.as_raw_fd();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"));
+    cmd.arg("--store-dir")
+        .arg(&store.store_dir)
+        .arg("--state-dir")
+        .arg(&store.state_dir);
+    unsafe {
+        cmd.pre_exec(move || {
+            use nix::fcntl::{F_GETFD, F_SETFD, FdFlag, fcntl};
+            use std::os::fd::BorrowedFd;
+            let fd = BorrowedFd::borrow_raw(raw_fd);
+            if let Ok(flags) = fcntl(fd, F_GETFD) {
+                let mut flags = FdFlag::from_bits_truncate(flags);
+                flags.remove(FdFlag::FD_CLOEXEC);
+                let _ = fcntl(fd, F_SETFD(flags));
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    drop(f);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(held.path.exists() && store.in_db(&held));
+    assert!(!trash.path.exists());
+}
+
+#[test]
+fn gc_rebases_canonical_runtime_roots_to_logical_store() {
+    use std::os::unix::process::CommandExt;
+    let store = TestStore::new_symlinked();
+
+    let held = store.add_path("held", 100);
+    let trash = store.add_path("trash", 100);
+
+    // Open via the canonical (symlink-resolved) path; /proc/<pid>/fd will
+    // report that path, which must be rebased to the logical store prefix
+    // before DB validation.
+    let canon = fs::canonicalize(held.path.join("file")).unwrap();
+    assert_ne!(canon, held.path.join("file"));
+    let f = fs::File::open(&canon).unwrap();
     let raw_fd = f.as_raw_fd();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"));
     cmd.arg("--store-dir")
