@@ -546,16 +546,17 @@ pub fn cli_main() -> Result<()> {
 fn parse_args() -> Result<Options> {
     let mut p = pico_args::Arguments::from_env();
     if p.contains("--help") {
-        eprintln!("Usage: fast-nix-optimise [OPTIONS]");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("      --dry-run             Show what would be done");
-        eprintln!("      --min-size BYTES      Skip files smaller than BYTES");
-        eprintln!("  -j, --jobs N              Concurrency [default: num CPUs]");
-        eprintln!("      --store-dir PATH      Nix store directory [default: /nix/store]");
-        eprintln!("      --state-dir PATH      Nix state directory [default: /nix/var/nix]");
+        println!("Usage: fast-nix-optimise [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("      --dry-run             Show what would be done");
+        println!("      --min-size BYTES      Skip files smaller than BYTES");
+        println!("  -j, --jobs N              Concurrency [default: num CPUs]");
+        println!("      --store-dir PATH      Nix store directory [default: /nix/store]");
+        println!("      --state-dir PATH      Nix state directory [default: /nix/var/nix]");
         std::process::exit(0);
     }
+
     let mut opts = Options {
         dry_run: p.contains("--dry-run"),
         ..Options::default()

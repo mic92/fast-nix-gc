@@ -49,18 +49,18 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
     let mut pargs = pico_args::Arguments::from_vec(args);
 
     if pargs.contains("--help") {
-        eprintln!("Usage: fast-nix-gc [OPTIONS]");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  -d, --delete-old             Remove old profile generations");
-        eprintln!("      --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d)");
-        eprintln!("      --dry-run                 Show what would be done");
-        eprintln!("      --ensure-free SIZE           Free until SIZE is available (e.g. 50G)");
-        eprintln!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
-        eprintln!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
-        eprintln!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
-        eprintln!("      --store-dir PATH          Nix store directory [default: /nix/store]");
-        eprintln!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
+        println!("Usage: fast-nix-gc [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("  -d, --delete-old              Remove old profile generations");
+        println!("      --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d)");
+        println!("      --dry-run                 Show what would be done");
+        println!("      --ensure-free SIZE        Free until SIZE is available (e.g. 50G)");
+        println!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
+        println!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
+        println!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
+        println!("      --store-dir PATH          Nix store directory [default: /nix/store]");
+        println!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
         std::process::exit(0);
     }
 
