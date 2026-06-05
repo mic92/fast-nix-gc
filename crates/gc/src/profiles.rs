@@ -55,7 +55,8 @@ fn find_generation_links(profile: &Path) -> Result<Vec<(PathBuf, u64)>> {
 fn current_generation(profile: &Path) -> Result<Option<u64>> {
     let target = match fs::read_link(profile) {
         Ok(t) => t,
-        Err(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("readlink {}", profile.display())),
     };
     let name = target
         .file_name()
@@ -78,11 +79,20 @@ fn current_generation(profile: &Path) -> Result<Option<u64>> {
 }
 
 fn delete_old_generations(profile: &Path, dry_run: bool) -> Result<()> {
-    let current = current_generation(profile)?;
+    // Fail closed: if we cannot tell which generation is active (profile
+    // gone or pointing at something that isn't a generation link),
+    // deleting "all but current" would delete the active system too.
+    let Some(current) = current_generation(profile)? else {
+        log::warn!(
+            "cannot determine current generation of {}; skipping",
+            profile.display()
+        );
+        return Ok(());
+    };
     let gens = find_generation_links(profile)?;
 
     for (path, r#gen) in &gens {
-        if Some(*r#gen) == current {
+        if *r#gen == current {
             continue;
         }
         if dry_run {
@@ -96,11 +106,18 @@ fn delete_old_generations(profile: &Path, dry_run: bool) -> Result<()> {
 }
 
 fn delete_generations_older_than(profile: &Path, cutoff: SystemTime, dry_run: bool) -> Result<()> {
-    let current = current_generation(profile)?;
+    // Same fail-closed rule as delete_old_generations.
+    let Some(current) = current_generation(profile)? else {
+        log::warn!(
+            "cannot determine current generation of {}; skipping",
+            profile.display()
+        );
+        return Ok(());
+    };
     let gens = find_generation_links(profile)?;
 
     for (path, r#gen) in &gens {
-        if Some(*r#gen) == current {
+        if *r#gen == current {
             continue;
         }
         let meta = match fs::symlink_metadata(path) {
@@ -347,6 +364,21 @@ mod tests {
         if let Ok(home) = std::env::var("HOME") {
             assert!(dirs.contains(&PathBuf::from(home)));
         }
+    }
+
+    #[test]
+    fn unparseable_current_generation_deletes_nothing() {
+        // Profile pointing at a non-generation target: refusing to guess
+        // protects the active generation from "delete all but current".
+        let (dir, profile) = setup_profile(3, 2);
+        fs::remove_file(&profile).unwrap();
+        symlink("/nix/store/custom-env", &profile).unwrap();
+
+        delete_old_generations(&profile, false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3]);
+
+        delete_generations_older_than(&profile, SystemTime::now(), false).unwrap();
+        assert_eq!(existing_gens(dir.path()), vec![1, 2, 3]);
     }
 
     #[test]
