@@ -94,12 +94,16 @@ fn try_lock_dir(path: &Path) -> Option<Flock<fs::File>> {
 /// Same lock Nix takes. Builders hold it shared while registering temp
 /// roots; we take it exclusive so the root set can't change under us.
 fn acquire_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
     let lock_path = state_dir.join("gc.lock");
+    // 0600 like Nix's openLockFile: a world-readable lock would let any
+    // local user flock it and block GC and builders indefinitely.
     let f = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("opening GC lock {}", lock_path.display()))?;
 
@@ -129,6 +133,18 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     // Acquire the global GC lock before anything else. Builders take a
     // shared lock when adding temp roots; holding the exclusive lock
     // ensures no new roots appear after we scan them.
+    // Free the reserved space file first (Nix: deletePath(reservedPath)).
+    // On a 100% full disk the SQLite invalidation below needs room to
+    // write before any store path has been unlinked.
+    if !dry_run {
+        let reserved = db.state_dir.join("db/reserved");
+        match fs::remove_file(&reserved) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("cannot remove {}: {e}", reserved.display()),
+        }
+    }
+
     let _gc_lock = acquire_gc_lock(&db.state_dir)?;
 
     if !dry_run {

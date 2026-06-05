@@ -311,12 +311,15 @@ fn libc_emlink() -> i32 {
 /// Hold gc.lock shared for the whole run so the GC (which takes it
 /// exclusive) cannot delete paths from under us.
 fn shared_gc_lock(state_dir: &Path) -> Result<Flock<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
     let lock_path = state_dir.join("gc.lock");
+    // 0600 like Nix's openLockFile.
     let f = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
     match Flock::lock(f, FlockArg::LockSharedNonblock) {

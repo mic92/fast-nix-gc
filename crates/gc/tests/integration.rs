@@ -1083,3 +1083,21 @@ fn gc_does_not_hang_on_tmp_fifo() {
     store.run_gc_ok(&[]);
     assert!(fifo.symlink_metadata().is_err(), "FIFO not collected");
 }
+
+#[test]
+fn gc_removes_reserved_space_file_and_creates_private_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let store = TestStore::new();
+    let reserved = store.state_dir.join("db/reserved");
+    fs::write(&reserved, vec![b'X'; 1024]).unwrap();
+
+    store.run_gc_ok(&[]);
+
+    assert!(!reserved.exists(), "reserved space file must be freed");
+    let mode = fs::metadata(store.state_dir.join("gc.lock"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "gc.lock must not be lockable by other users");
+}
