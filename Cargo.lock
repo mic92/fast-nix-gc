@@ -354,7 +354,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fast-nix-common",
- "foldhash 0.2.0",
  "harmonia-store-db",
  "log",
  "nix",

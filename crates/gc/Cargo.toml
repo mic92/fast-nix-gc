@@ -12,8 +12,6 @@ walkdir.workspace = true
 anyhow.workspace = true
 nix.workspace = true
 log.workspace = true
-rusqlite.workspace = true
-foldhash.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
