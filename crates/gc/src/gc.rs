@@ -72,7 +72,22 @@ use nix::fcntl::{Flock, FlockArg};
 /// Lock a `tmp-*` build dir before deleting. None means a builder still
 /// holds it. Caller keeps the fd through deletion to avoid a TOCTOU race.
 fn try_lock_dir(path: &Path) -> Option<Flock<fs::File>> {
-    let f = fs::File::open(path).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK: a stray FIFO named tmp-* must not block open() forever
+    // while we hold the exclusive gc.lock.
+    let f = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("cannot open {} for locking: {e}", path.display());
+            }
+            return None;
+        }
+    };
     Flock::lock(f, FlockArg::LockExclusiveNonblock).ok()
 }
 
@@ -203,26 +218,31 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     // Also find entries on disk that aren't in the DB at all.
     // Compare by basename to avoid allocating a full-path string per entry.
     let store_prefix = graph.store_prefix.clone();
-    let mut unknown_on_disk: Vec<String> = Vec::new();
+    // Raw OsString names: a non-UTF-8 entry can't be in the DB (it stores
+    // text), but it is still garbage that must be unlinked by its real
+    // bytes — a lossy name would aim remove_file at a nonexistent path.
+    let mut unknown_on_disk: Vec<std::ffi::OsString> = Vec::new();
     if let Ok(entries) = fs::read_dir(&db.real_store_dir) {
         for entry in entries.flatten() {
             let raw = entry.file_name();
-            let name = raw.to_string_lossy();
             // read_dir never yields "." or "..".
-            if name == ".links" {
-                continue;
+            if let Some(name) = raw.to_str() {
+                if name == ".links" {
+                    continue;
+                }
+                // An entry shares an active build's hash part if its first
+                // 32 chars match (covers `<path>.lock` and friends).
+                let hash_part_active = name.len() >= 32
+                    && name.is_char_boundary(32)
+                    && temp_root_hashes.contains(&name[..32]);
+                if bidx.idx_of_basename(name).is_some()
+                    || temp_root_basenames.contains(name)
+                    || hash_part_active
+                {
+                    continue;
+                }
             }
-            // An entry shares an active build's hash part if its first 32
-            // chars match (covers `<path>.lock` and friends).
-            let hash_part_active = name.len() >= 32
-                && name.is_char_boundary(32)
-                && temp_root_hashes.contains(&name[..32]);
-            if bidx.idx_of_basename(name.as_ref()).is_none()
-                && !temp_root_basenames.contains(name.as_ref())
-                && !hash_part_active
-            {
-                unknown_on_disk.push(name.into_owned());
-            }
+            unknown_on_disk.push(raw);
         }
     }
     if !unknown_on_disk.is_empty() {
@@ -249,7 +269,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
             count += 1;
         }
         for name in &unknown_on_disk {
-            writeln!(stdout, "{store_prefix}{name}")?;
+            writeln!(stdout, "{store_prefix}{}", name.display())?;
             count += 1;
         }
         return Ok((estimated, count));
@@ -355,8 +375,13 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
             let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
             let real_path = real_store_dir.join(basename);
             log::debug!("deleting '{path}'");
-            if let Ok(freed) = delete_store_path(&real_path) {
-                bytes_freed.fetch_add(freed, Ordering::Relaxed);
+            match delete_store_path(&real_path) {
+                Ok(freed) => {
+                    bytes_freed.fetch_add(freed, Ordering::Relaxed);
+                }
+                // Row already invalidated; the leftover is picked up as
+                // unknown-on-disk by the next run.
+                Err(e) => log::warn!("failed to delete {}: {e:#}", real_path.display()),
             }
             live.end_delete_node(node);
         });
@@ -374,26 +399,33 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         // shielded by protected_unknown. See tempRootStale in
         // alloy/gc_db_consistency.als.
         let mut unknown_on_disk = unknown_on_disk;
-        unknown_on_disk.retain(
-            |name| match db.is_valid_path(&format!("{store_prefix}{name}")) {
+        unknown_on_disk.retain(|name| {
+            // A non-UTF-8 name can't be a DB path (the DB stores text).
+            let Some(name) = name.to_str() else {
+                return true;
+            };
+            match db.is_valid_path(&format!("{store_prefix}{name}")) {
                 Ok(valid) => !valid,
                 Err(e) => {
                     log::warn!("skipping {store_prefix}{name}: validity check failed: {e}");
                     false
                 }
-            },
-        );
-        unknown_on_disk.par_iter().for_each(|name| {
-            if !live.try_begin_delete_unknown(name) {
+            }
+        });
+        unknown_on_disk.par_iter().for_each(|raw| {
+            // The liveset/protocol key is textual; non-UTF-8 names can't
+            // collide with anything a builder protects.
+            let name = raw.to_string_lossy();
+            if !live.try_begin_delete_unknown(&name) {
                 return;
             }
-            let real_path = real_store_dir.join(name);
+            let real_path = real_store_dir.join(raw);
             let _tmp_lock = if name.starts_with("tmp-") {
                 match try_lock_dir(&real_path) {
                     Some(f) => Some(f),
                     None => {
                         log::debug!("skipping locked tempdir {}", real_path.display());
-                        live.end_delete_unknown(name);
+                        live.end_delete_unknown(&name);
                         return;
                     }
                 }
@@ -401,11 +433,14 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
                 None
             };
             log::debug!("deleting '{store_prefix}{name}'");
-            if let Ok(freed) = delete_store_path(&real_path) {
-                bytes_freed.fetch_add(freed, Ordering::Relaxed);
+            match delete_store_path(&real_path) {
+                Ok(freed) => {
+                    bytes_freed.fetch_add(freed, Ordering::Relaxed);
+                    paths_deleted.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => log::warn!("failed to delete {}: {e:#}", real_path.display()),
             }
-            live.end_delete_unknown(name);
-            paths_deleted.fetch_add(1, Ordering::Relaxed);
+            live.end_delete_unknown(&name);
         });
     }
 

@@ -1052,3 +1052,32 @@ fn gc_keeps_lock_file_of_active_build() {
     assert!(!stale_lock.exists(), "stale lock file kept");
     drop(lock);
 }
+
+#[test]
+fn gc_deletes_non_utf8_store_entry() {
+    use std::os::unix::ffi::OsStrExt;
+    let store = TestStore::new();
+    let raw = std::ffi::OsStr::from_bytes(b"junk-\xff\xfe-entry");
+    let path = store.store_dir.join(raw);
+    fs::write(&path, "garbage").unwrap();
+
+    let out = store.run_gc_ok(&[]);
+
+    assert!(
+        path.symlink_metadata().is_err(),
+        "non-UTF-8 garbage entry must be deleted"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 store paths deleted"), "stdout: {stdout}");
+}
+
+#[test]
+fn gc_does_not_hang_on_tmp_fifo() {
+    let store = TestStore::new();
+    let fifo = store.store_dir.join("tmp-fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits(0o644).unwrap()).unwrap();
+
+    // Must terminate (no blocking open) and remove the FIFO.
+    store.run_gc_ok(&[]);
+    assert!(fifo.symlink_metadata().is_err(), "FIFO not collected");
+}
