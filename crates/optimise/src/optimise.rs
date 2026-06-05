@@ -447,14 +447,17 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
                             return Ok(());
                         }
                     };
-                    // Walk done; release the slot before potentially
-                    // blocking on a full channel.
-                    drop(permit);
+                    // Hold the permit until the file list is drained:
+                    // releasing it earlier lets new walks pile up while
+                    // this one blocks on a full channel, accumulating
+                    // store-wide metadata in memory. No deadlock: the
+                    // consumer never takes walk permits.
                     for f in files {
                         if tx.send(f).await.is_err() {
                             break;
                         }
                     }
+                    drop(permit);
                     Ok(())
                 });
                 while let Some(res) = walks.try_join_next() {
