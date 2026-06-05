@@ -54,11 +54,6 @@ impl LiveSet {
         }
     }
 
-    /// Snapshot read; not a delete claim, does not block `protect()`.
-    pub fn is_protected(&self, node: u32) -> bool {
-        self.inner.lock().unwrap().protected[node as usize]
-    }
-
     /// Atomically check that `node` is unprotected and mark it pending.
     /// Returns `false` (skip deletion) if the node was protected meanwhile.
     pub fn try_begin_delete_node(&self, node: u32) -> bool {
@@ -75,6 +70,27 @@ impl LiveSet {
         g.pending_nodes.remove(&node);
         drop(g);
         self.cond.notify_all();
+    }
+
+    /// Atomically partition `nodes` into (claimed, skipped): skipped nodes
+    /// are protected; claimed ones are marked pending in the same critical
+    /// section. Claiming before the DB invalidation closes the race where
+    /// `protect()` acks a path whose ValidPaths row is about to be deleted:
+    /// any later `protect()` of a claimed node blocks until its unlink
+    /// finished, so the builder re-checks validity and re-registers.
+    pub fn claim_nodes(&self, nodes: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        let mut g = self.inner.lock().unwrap();
+        let mut claimed = Vec::with_capacity(nodes.len());
+        let mut skipped = Vec::new();
+        for &n in nodes {
+            if g.protected[n as usize] {
+                skipped.push(n);
+            } else {
+                g.pending_nodes.insert(n);
+                claimed.push(n);
+            }
+        }
+        (claimed, skipped)
     }
 
     /// Same as `try_begin_delete_node` for paths not in the graph.
@@ -394,6 +410,38 @@ mod tests {
             conn.read_exact(&mut ack).unwrap();
             assert_eq!(ack, [b'1']);
         }
+    }
+
+    #[test]
+    fn claim_nodes_partitions_and_blocks_protect() {
+        let g = Arc::new(graph("/nix/store/", &[("a", &[]), ("b", &[])]));
+        let live = Arc::new(LiveSet::new(g.len(), HashSet::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let _server = GcSocketServer::start(dir.path(), Arc::clone(&live), Arc::clone(&g)).unwrap();
+        let sock = dir.path().join("gc-socket/socket");
+
+        // Protect b up front; claim must skip it and claim a.
+        let mut conn = UnixStream::connect(&sock).unwrap();
+        conn.write_all(b"/nix/store/b\n").unwrap();
+        let mut ack = [0u8; 1];
+        conn.read_exact(&mut ack).unwrap();
+
+        let (claimed, skipped) = live.claim_nodes(&[0, 1]);
+        assert_eq!(claimed, vec![0]);
+        assert_eq!(skipped, vec![1]);
+
+        // A protect for the claimed node must block until its unlink is
+        // done (the DB row is already gone; acking earlier would tell the
+        // builder a deleted row is protected).
+        conn.write_all(b"/nix/store/a\n").unwrap();
+        conn.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        assert!(conn.read_exact(&mut ack).is_err(), "acked mid-deletion");
+
+        live.end_delete_node(0);
+        conn.set_read_timeout(None).unwrap();
+        conn.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [b'1']);
     }
 
     #[test]

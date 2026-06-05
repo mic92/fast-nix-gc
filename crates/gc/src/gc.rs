@@ -326,42 +326,41 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
                 i += 1;
             }
         }
-        // Snapshot-filter, don't pre-claim: protect() should wait for the
-        // rayon-bounded in-flight set, not the whole chunk.
-        let (mut claimed, skipped): (Vec<u32>, Vec<u32>) =
-            chunk.iter().copied().partition(|&n| !live.is_protected(n));
-        // protect() marks closures atomically, but this filter reads one
-        // node at a time: it may have kept a reference whose referrer got
-        // protected a moment later. Drop the closures of skipped paths.
+        // Claim (mark pending) atomically with the protection check,
+        // *before* invalidating DB rows. A protect() arriving later for a
+        // claimed node blocks until the unlink finished, so a builder is
+        // never acked while the row deletion is still in flight — it sees
+        // a consistent "gone" state and re-registers.
+        let (mut claimed, skipped) = live.claim_nodes(&chunk);
+        // protect() marks closures atomically, but the claim is per node:
+        // it may have kept a reference whose referrer got protected a
+        // moment earlier. Drop the closures of skipped paths.
         if !skipped.is_empty() {
             let keep_out = graph.compute_closure(&skipped);
-            claimed.retain(|&n| !keep_out[n as usize]);
+            claimed.retain(|&n| {
+                if keep_out[n as usize] {
+                    live.end_delete_node(n);
+                    false
+                } else {
+                    true
+                }
+            });
         }
         // Invalidate rows before unlinking: builders trust isValidPath(),
         // so a path must never look valid after its disk entry is gone.
-        // Paths protected after this point stay on disk; their builder
-        // re-registers them or the next run collects them as
-        // unknown-on-disk. See alloy/gc_db_consistency.als.
+        // See alloy/gc_db_consistency.als.
         db.invalidate_paths(claimed.iter().map(|&n| graph.paths[n as usize].as_str()))?;
-        let n_deleted = claimed
-            .par_iter()
-            .copied()
-            .filter(|&node| {
-                if !live.try_begin_delete_node(node) {
-                    return false;
-                }
-                let path = &graph.paths[node as usize];
-                let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
-                let real_path = real_store_dir.join(basename);
-                log::debug!("deleting '{path}'");
-                if let Ok(freed) = delete_store_path(&real_path) {
-                    bytes_freed.fetch_add(freed, Ordering::Relaxed);
-                }
-                live.end_delete_node(node);
-                true
-            })
-            .count();
-        paths_deleted.fetch_add(n_deleted as u64, Ordering::Relaxed);
+        claimed.par_iter().for_each(|&node| {
+            let path = &graph.paths[node as usize];
+            let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
+            let real_path = real_store_dir.join(basename);
+            log::debug!("deleting '{path}'");
+            if let Ok(freed) = delete_store_path(&real_path) {
+                bytes_freed.fetch_add(freed, Ordering::Relaxed);
+            }
+            live.end_delete_node(node);
+        });
+        paths_deleted.fetch_add(claimed.len() as u64, Ordering::Relaxed);
     }
 
     // Unknown-on-disk paths: also parallel. tmp-* dirs hold flock through
