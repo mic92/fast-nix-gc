@@ -27,6 +27,9 @@ fn parse_size(s: &str) -> Result<u64> {
         _ => (s, 1),
     };
     let n: f64 = num.parse().with_context(|| format!("invalid size '{s}'"))?;
+    if !n.is_finite() || n < 0.0 || n * mult as f64 > u64::MAX as f64 {
+        bail!("size '{s}' is out of range");
+    }
     Ok((n * mult as f64) as u64)
 }
 
@@ -225,5 +228,9 @@ mod tests {
         assert_eq!(parse_size("1.5K").unwrap(), 1536);
         assert_eq!(parse_size(" 4M ").unwrap(), 4 * 1024 * 1024);
         assert!(parse_size("abc").is_err());
+        assert!(parse_size("-5G").is_err());
+        assert!(parse_size("inf").is_err());
+        assert!(parse_size("NaN").is_err());
+        assert!(parse_size("99999999999999999999G").is_err());
     }
 }

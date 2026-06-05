@@ -9,19 +9,27 @@ use std::time::{Duration, SystemTime};
 
 /// Parse Nix-style time specs like "30d", "4h", "2w", "1m".
 pub fn parse_older_than(spec: &str) -> Result<SystemTime> {
-    if spec.len() < 2 {
+    // Take the last *character*; a byte-based split_at would panic on
+    // multi-byte input like "30日".
+    let Some((idx, unit)) = spec.char_indices().last() else {
+        bail!("invalid time spec '{}', expected e.g. '30d'", spec);
+    };
+    let num_str = &spec[..idx];
+    if num_str.is_empty() {
         bail!("invalid time spec '{}', expected e.g. '30d'", spec);
     }
-    // split_at must land on a char boundary; suffix is always ASCII.
-    let (num_str, unit) = spec.split_at(spec.len() - 1);
     let num: u64 = num_str.parse().context("invalid number in time spec")?;
-    let secs = match unit {
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 7 * 86400,
-        "m" => num * 30 * 86400,
+    let unit_secs = match unit {
+        'h' => 3600,
+        'd' => 86400,
+        'w' => 7 * 86400,
+        'm' => 30 * 86400,
         _ => bail!("unknown time unit '{}', use h/d/w/m", unit),
     };
+    let secs = num
+        .checked_mul(unit_secs)
+        .filter(|&s| s <= i64::MAX as u64)
+        .with_context(|| format!("time spec '{spec}' is out of range"))?;
     Ok(SystemTime::now() - Duration::from_secs(secs))
 }
 
@@ -247,6 +255,12 @@ mod tests {
         assert!(parse_older_than("d").is_err());
         assert!(parse_older_than("5x").is_err());
         assert!(parse_older_than("xd").is_err());
+        // Multi-byte unit must error, not panic on a char boundary.
+        assert!(parse_older_than("30日").is_err());
+        assert!(parse_older_than("日").is_err());
+        // Overflowing multiplication must error, not wrap.
+        assert!(parse_older_than("99999999999999999999d").is_err());
+        assert!(parse_older_than("9999999999999999999d").is_err());
     }
 
     #[test]
