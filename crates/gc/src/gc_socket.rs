@@ -42,11 +42,11 @@ struct LiveInner {
 }
 
 impl LiveSet {
-    pub fn new(n_nodes: usize, protected_unknown: HashSet<String>) -> Self {
+    pub fn new(n_nodes: usize) -> Self {
         LiveSet {
             inner: Mutex::new(LiveInner {
                 protected: vec![false; n_nodes],
-                protected_unknown,
+                protected_unknown: HashSet::default(),
                 pending_nodes: HashSet::default(),
                 pending_unknown: HashSet::default(),
             }),
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn drop_returns_when_idle_accept_loop_is_waiting() {
         let g = Arc::new(graph("/nix/store/", &[]));
-        let live = Arc::new(LiveSet::new(0, HashSet::default()));
+        let live = Arc::new(LiveSet::new(0));
         let dir = tempfile::tempdir().unwrap();
         let server = GcSocketServer::start(dir.path(), live, g).unwrap();
 
@@ -335,7 +335,7 @@ mod tests {
             "/nix/store/",
             &[("a", &[1]), ("b", &[2]), ("c", &[]), ("d", &[])],
         ));
-        let live = Arc::new(LiveSet::new(g.len(), HashSet::default()));
+        let live = Arc::new(LiveSet::new(g.len()));
         let dir = tempfile::tempdir().unwrap();
         let server = GcSocketServer::start(dir.path(), Arc::clone(&live), Arc::clone(&g)).unwrap();
         let sock = dir.path().join("gc-socket/socket");
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn protect_blocks_until_pending_delete_finishes() {
         let g = Arc::new(graph("/nix/store/", &[("x", &[])]));
-        let live = Arc::new(LiveSet::new(g.len(), HashSet::default()));
+        let live = Arc::new(LiveSet::new(g.len()));
         let dir = tempfile::tempdir().unwrap();
         let _server = GcSocketServer::start(dir.path(), Arc::clone(&live), Arc::clone(&g)).unwrap();
         let sock = dir.path().join("gc-socket/socket");
@@ -394,7 +394,7 @@ mod tests {
             "/nix/store/",
             &[("a", &[2]), ("b", &[2]), ("c", &[])],
         ));
-        let live = Arc::new(LiveSet::new(g.len(), HashSet::default()));
+        let live = Arc::new(LiveSet::new(g.len()));
         let dir = tempfile::tempdir().unwrap();
         let _server = GcSocketServer::start(dir.path(), Arc::clone(&live), Arc::clone(&g)).unwrap();
         let sock = dir.path().join("gc-socket/socket");
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn claim_nodes_partitions_and_blocks_protect() {
         let g = Arc::new(graph("/nix/store/", &[("a", &[]), ("b", &[])]));
-        let live = Arc::new(LiveSet::new(g.len(), HashSet::default()));
+        let live = Arc::new(LiveSet::new(g.len()));
         let dir = tempfile::tempdir().unwrap();
         let _server = GcSocketServer::start(dir.path(), Arc::clone(&live), Arc::clone(&g)).unwrap();
         let sock = dir.path().join("gc-socket/socket");
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn unknown_path_protected_by_basename() {
         let g = Arc::new(graph("/nix/store/", &[]));
-        let live = Arc::new(LiveSet::new(0, HashSet::default()));
+        let live = Arc::new(LiveSet::new(0));
         let dir = tempfile::tempdir().unwrap();
         let _server = GcSocketServer::start(dir.path(), Arc::clone(&live), Arc::clone(&g)).unwrap();
         let sock = dir.path().join("gc-socket/socket");

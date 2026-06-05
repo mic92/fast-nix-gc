@@ -157,7 +157,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
 
     // Start the gc-socket as soon as the graph is loaded so builders stop
     // busy-polling gc.lock. Roots received only shrink the dead set.
-    let live = Arc::new(LiveSet::new(graph.len(), crate::HashSet::default()));
+    let live = Arc::new(LiveSet::new(graph.len()));
     let _gc_socket = if dry_run {
         None
     } else {
