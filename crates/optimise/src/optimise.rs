@@ -22,6 +22,8 @@ pub struct Stats {
     pub bytes_freed: AtomicU64,
     pub files_skipped: AtomicU64,
     pub link_enospc: AtomicU64,
+    /// Files or paths skipped because of I/O errors (logged, not fatal).
+    pub errors: AtomicU64,
 }
 
 pub struct Options {
@@ -368,11 +370,13 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
 
     let producer = {
         let known = known_inodes.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
             let mut walks: JoinSet<Result<()>> = JoinSet::new();
             for store_path in paths {
                 let permit = walk_sem.clone().acquire_owned().await?;
                 let known = known.clone();
+                let stats = stats.clone();
                 let tx = file_tx.clone();
                 let store_path = store_path.to_absolute_path(&store_dir_typed);
                 walks.spawn(async move {
@@ -418,7 +422,18 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
                             Ok(out)
                         },
                     )
-                    .await??;
+                    .await?;
+                    // One unreadable path must not abort the whole run;
+                    // log and dedup the rest, like nix-store --optimise.
+                    let files = match files {
+                        Ok(f) => f,
+                        Err(e) => {
+                            log::warn!("skipping store path: {e:#}");
+                            stats.errors.fetch_add(1, Ordering::Relaxed);
+                            drop(permit);
+                            return Ok(());
+                        }
+                    };
                     // Walk done; release the slot before potentially
                     // blocking on a full channel.
                     drop(permit);
@@ -447,8 +462,13 @@ pub async fn optimise_store(opts: Options) -> Result<Stats> {
         let opts = opts.clone();
         let stats = stats.clone();
         tasks.spawn(async move {
+            let stats2 = stats.clone();
             let _p = permit;
-            optimise_file(file, meta, links_dir, store_dir, opts, stats).await
+            if let Err(e) = optimise_file(file, meta, links_dir, store_dir, opts, stats).await {
+                log::warn!("skipping file: {e:#}");
+                stats2.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
         });
         while let Some(res) = tasks.try_join_next() {
             res??;
@@ -489,6 +509,10 @@ pub fn cli_main() -> Result<()> {
     let enospc = stats.link_enospc.load(Ordering::Relaxed);
     if enospc > 0 {
         log::warn!("could not create {enospc} link(s): no space left on device");
+    }
+    let errors = stats.errors.load(Ordering::Relaxed);
+    if errors > 0 {
+        log::warn!("skipped {errors} file(s)/path(s) due to errors");
     }
     let linked = stats.files_linked.load(Ordering::Relaxed);
     let freed = stats.bytes_freed.load(Ordering::Relaxed);
@@ -532,6 +556,9 @@ fn parse_args() -> Result<Options> {
         .opt_value_from_str("--jobs")?
         .or(p.opt_value_from_str("-j")?)
     {
+        if v == 0 {
+            bail!("--jobs must be at least 1");
+        }
         opts.jobs = v;
     }
     if let Some(v) = p.opt_value_from_str("--store-dir")? {
@@ -849,6 +876,31 @@ mod tests {
         let stats = optimise_store(run_opts(&store, &state)).await.unwrap();
         assert_eq!(stats.files_linked.load(Ordering::Relaxed), 0);
         assert_eq!(stats.files_skipped.load(Ordering::Relaxed), 1);
+        unlock(&p1);
+        unlock(&p2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_path_is_skipped_not_fatal() {
+        if nix::unistd::geteuid().is_root() {
+            return; // root bypasses permission checks
+        }
+        let tmp = tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&store).unwrap();
+        let bad = mk_store_path(&store, "llllllllllllllllllllllllllllllll-l", CONTENT);
+        let p1 = mk_store_path(&store, "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-m", CONTENT);
+        let p2 = mk_store_path(&store, "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-n", CONTENT);
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        mk_db(&state, &[&bad, &p1, &p2]);
+
+        let stats = optimise_store(run_opts(&store, &state)).await.unwrap();
+
+        // The unreadable path is skipped; the other two still dedup.
+        assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.files_linked.load(Ordering::Relaxed), 1);
+        unlock(&bad);
         unlock(&p1);
         unlock(&p2);
     }
