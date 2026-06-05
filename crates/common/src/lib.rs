@@ -132,3 +132,41 @@ mod tests {
 }
 pub mod nix_config;
 pub mod temp_roots;
+
+/// Closest CLI flag by edit distance, for "did you mean" hints.
+/// Returns None unless a candidate is within distance 3.
+pub fn closest_match<'a>(arg: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    fn edit_distance(a: &str, b: &str) -> usize {
+        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        let mut cur = vec![0; b.len() + 1];
+        for i in 1..=a.len() {
+            cur[0] = i;
+            for j in 1..=b.len() {
+                let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+                cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        prev[b.len()]
+    }
+    candidates
+        .iter()
+        .map(|c| (edit_distance(arg, c), *c))
+        .filter(|&(d, _)| d <= 3)
+        .min()
+        .map(|(_, c)| c)
+}
+
+#[cfg(test)]
+mod closest_match_tests {
+    use super::closest_match;
+
+    #[test]
+    fn suggests_near_misses_only() {
+        let known = &["--dry-run", "--keep-recent", "--store-dir"];
+        assert_eq!(closest_match("--keep-resent", known), Some("--keep-recent"));
+        assert_eq!(closest_match("--dry-rnu", known), Some("--dry-run"));
+        assert_eq!(closest_match("--completely-different", known), None);
+    }
+}

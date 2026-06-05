@@ -85,8 +85,25 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
     };
     // A typo'd flag (e.g. --dry-rnu) must not silently run a destructive GC.
     let rest = pargs.finish();
-    if !rest.is_empty() {
-        bail!("unexpected arguments: {rest:?}");
+    if let Some(first) = rest.first() {
+        let arg = first.to_string_lossy();
+        const KNOWN: &[&str] = &[
+            "-d",
+            "--delete-old",
+            "--delete-older-than",
+            "--dry-run",
+            "--ensure-free",
+            "--keep-recent",
+            "--keep-outputs",
+            "--keep-derivations",
+            "--store-dir",
+            "--state-dir",
+            "--help",
+        ];
+        match fast_nix_common::closest_match(&arg, KNOWN) {
+            Some(s) => bail!("unexpected argument '{arg}'; did you mean '{s}'?"),
+            None => bail!("unexpected arguments: {rest:?} (see --help)"),
+        }
     }
     Ok(args)
 }
@@ -197,7 +214,12 @@ mod tests {
 
     #[test]
     fn parse_args_rejects_unknown_arguments() {
-        assert!(parse_args_from(args(&["--dry-rnu"])).is_err());
+        let err = parse_args_from(args(&["--dry-rnu"])).err().unwrap();
+        assert!(err.to_string().contains("--dry-run"), "{err}");
+        let err = parse_args_from(args(&["--keep-resent", "2d"]))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("--keep-recent"), "{err}");
         assert!(parse_args_from(args(&["--dry-run", "extra"])).is_err());
         let parsed = parse_args_from(args(&["--dry-run"])).unwrap();
         assert!(parsed.dry_run);

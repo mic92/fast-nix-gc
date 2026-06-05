@@ -581,8 +581,21 @@ fn parse_args() -> Result<Options> {
         opts.state_dir = v;
     }
     let rest = p.finish();
-    if !rest.is_empty() {
-        bail!("unexpected arguments: {:?}", rest);
+    if let Some(first) = rest.first() {
+        let arg = first.to_string_lossy();
+        const KNOWN: &[&str] = &[
+            "--dry-run",
+            "--min-size",
+            "-j",
+            "--jobs",
+            "--store-dir",
+            "--state-dir",
+            "--help",
+        ];
+        match fast_nix_common::closest_match(&arg, KNOWN) {
+            Some(s) => bail!("unexpected argument '{arg}'; did you mean '{s}'?"),
+            None => bail!("unexpected arguments: {rest:?} (see --help)"),
+        }
     }
     Ok(opts)
 }
