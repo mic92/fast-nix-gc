@@ -91,7 +91,17 @@ impl NixDb {
         // Both queries must see the same snapshot, otherwise a path
         // registered between them ends up with missing edges.
         self.conn.execute_batch("BEGIN")?;
+        let result = self.load_graph_in_txn();
+        if result.is_err() {
+            // Leave the connection usable for the caller.
+            self.conn.execute_batch("ROLLBACK").ok();
+        } else {
+            self.conn.execute_batch("COMMIT")?;
+        }
+        result
+    }
 
+    fn load_graph_in_txn(&self) -> Result<StoreGraph> {
         // ids are dense autoincrement, so a Vec works as the id->idx map.
         let max_id: i64 =
             self.conn
@@ -219,7 +229,6 @@ impl NixDb {
             }
         }
 
-        self.conn.execute_batch("COMMIT")?;
 
         let mut ref_offsets = vec![0u32; n + 1];
         for &(from, _) in &edges {
