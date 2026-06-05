@@ -269,21 +269,15 @@ impl NixDb {
         })
     }
 
-    /// Return all valid store paths (full paths, e.g. `/nix/store/xxx-foo`).
-    pub fn valid_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT path FROM ValidPaths")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
-
     /// `StoreDir` view of `store_dir`. Fails if it isn't valid UTF-8.
     pub fn store_dir_typed(&self) -> Result<StoreDir> {
         StoreDir::new(self.store_dir.clone())
             .map_err(|e| anyhow!("{}: {e}", self.store_dir.display()))
     }
 
-    /// Like `valid_paths` but parsed into `StorePath`. Rows that don't parse
-    /// (corrupt DB) are returned as an error rather than silently dropped.
+    /// Return all valid store paths parsed into `StorePath`. Rows that
+    /// don't parse (corrupt DB) are returned as an error rather than
+    /// silently dropped.
     pub fn valid_store_paths(&self) -> Result<Vec<StorePath>> {
         let store_dir = self.store_dir_typed()?;
         let mut stmt = self.conn.prepare("SELECT path FROM ValidPaths")?;
@@ -680,12 +674,17 @@ mod tests {
     }
 
     #[test]
-    fn valid_paths_and_typed_variants() {
+    fn valid_store_paths_and_typed_variants() {
         let t = setup();
         add_path(&t.db, &format!("{H1}-a"), 1, 1);
         add_path(&t.db, &format!("{H2}-b"), 1, 1);
 
-        let mut paths = t.db.valid_paths().unwrap();
+        let mut paths: Vec<String> =
+            t.db.valid_store_paths()
+                .unwrap()
+                .iter()
+                .map(|p| format!("/nix/store/{p}"))
+                .collect();
         paths.sort();
         assert_eq!(
             paths,
@@ -724,7 +723,13 @@ mod tests {
         t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
             .unwrap();
 
-        assert_eq!(t.db.valid_paths().unwrap(), vec![full(&format!("{H3}-c"))]);
+        let remaining: Vec<String> =
+            t.db.valid_store_paths()
+                .unwrap()
+                .iter()
+                .map(|p| format!("/nix/store/{p}"))
+                .collect();
+        assert_eq!(remaining, vec![full(&format!("{H3}-c"))]);
         let refs: i64 =
             t.db.conn
                 .query_row("SELECT COUNT(*) FROM Refs", [], |r| r.get(0))
