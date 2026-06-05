@@ -207,7 +207,7 @@ async fn optimise_file(
         stats.files_skipped.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    if ft.is_file() && meta.len() < opts.min_size {
+    if meta.len() < opts.min_size {
         stats.files_skipped.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
