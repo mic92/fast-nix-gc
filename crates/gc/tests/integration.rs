@@ -1105,3 +1105,122 @@ fn gc_removes_reserved_space_file_and_creates_private_lock() {
         & 0o777;
     assert_eq!(mode, 0o600, "gc.lock must not be lockable by other users");
 }
+
+/// Connect to the gc-socket during the early window (before the graph is
+/// loaded), register a root, and let the GC continue.
+fn run_gc_with_early_root(
+    store: &TestStore,
+    root: &str,
+    extra_args: &[&str],
+) -> std::process::Output {
+    use std::io::{Read, Write};
+
+    let fifo = store.dir.path().join("sync-early");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits(0o600).unwrap()).unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(&store.store_dir)
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .args(extra_args)
+        .env("_FAST_NIX_GC_TEST_SYNC_EARLY", &fifo)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Blocks until the GC reached the sync point: lock held, early
+    // socket up, graph not loaded yet.
+    let fifo_w = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+
+    let sock = store.state_dir.join("gc-socket/socket");
+    let mut conn = std::os::unix::net::UnixStream::connect(&sock)
+        .expect("gc-socket must be served before the graph is loaded");
+    conn.write_all(format!("{root}\n").as_bytes()).unwrap();
+    let mut ack = [0u8; 1];
+    conn.read_exact(&mut ack).unwrap();
+    assert_eq!(ack, [b'1'], "early root must be acked immediately");
+
+    drop(fifo_w); // release the GC
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+#[test]
+fn gc_socket_serves_before_graph_load_and_keeps_early_roots() {
+    let store = TestStore::new();
+    let dead = store.add_path("now-needed", 100);
+    let trash = store.add_path("trash", 100);
+
+    run_gc_with_early_root(&store, &dead.full, &[]);
+
+    assert!(
+        dead.path.exists() && store.in_db(&dead),
+        "early-socket root was deleted"
+    );
+    assert!(!trash.path.exists());
+}
+
+#[test]
+fn gc_dry_run_serves_socket_and_honors_roots() {
+    let store = TestStore::new();
+    let dead = store.add_path("now-needed", 100);
+    let trash = store.add_path("trash", 100);
+
+    let out = run_gc_with_early_root(&store, &dead.full, &["--dry-run"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(&dead.full),
+        "protected path reported as dead: {stdout}"
+    );
+    assert!(stdout.contains(&trash.full), "stdout: {stdout}");
+    assert!(dead.path.exists() && trash.path.exists());
+}
+
+#[test]
+fn gc_socket_root_mid_gc_keeps_path_and_deletes_rest() {
+    // Mirror of the NixOS test's gc-socket phase: while the delete loop is
+    // blocked on _FAST_NIX_GC_TEST_SYNC, protect one dead path over the
+    // socket; after release, it survives and the other dead path is gone.
+    use std::io::{Read, Write};
+    let store = TestStore::new();
+    let saved = store.add_path("saved", 10);
+    let other = store.add_path("other", 10);
+
+    let fifo = store.dir.path().join("sync.fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits(0o600).unwrap()).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fast-nix-gc"))
+        .arg("--store-dir")
+        .arg(&store.store_dir)
+        .arg("--state-dir")
+        .arg(&store.state_dir)
+        .env("_FAST_NIX_GC_TEST_SYNC", &fifo)
+        .spawn()
+        .unwrap();
+
+    let fifo_w = fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+
+    let sock = store.state_dir.join("gc-socket/socket");
+    let mut conn = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    conn.write_all(format!("{}\n", saved.full).as_bytes())
+        .unwrap();
+    let mut ack = [0u8; 1];
+    conn.read_exact(&mut ack).unwrap();
+    assert_eq!(ack, [b'1']);
+
+    drop(fifo_w);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    assert!(saved.path.exists() && store.in_db(&saved), "saved deleted");
+    assert!(!other.path.exists(), "other survived");
+    assert!(!store.in_db(&other));
+}

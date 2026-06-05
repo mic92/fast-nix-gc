@@ -150,24 +150,61 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         make_store_writable(&db.real_store_dir)?;
     }
 
+    // Serve the gc-socket immediately after taking the lock, like Nix:
+    // builders that lost the shared-lock race retry connecting every
+    // 100ms, so the socket must exist before the (potentially long)
+    // graph load — and during dry runs, which hold the lock too.
+    //
+    // Phase 1: no graph yet, so every received root is acked instantly
+    // and recorded by basename. That is sound because nothing can be
+    // deleted before the graph exists; the roots are replayed below.
+    let store_prefix = format!("{}/", db.store_dir.display());
+    let early_live = Arc::new(LiveSet::new(0));
+    // A dry run on a read-only state dir can still report; without the
+    // socket no builder can run anyway (they need temproots).
+    let start_socket = |live: Arc<LiveSet>, graph: Arc<crate::db::StoreGraph>| -> Result<_> {
+        match GcSocketServer::start(&db.state_dir, live, graph) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if dry_run => {
+                log::warn!("cannot serve gc-socket: {e:#}");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    let early_socket = start_socket(
+        Arc::clone(&early_live),
+        Arc::new(crate::db::StoreGraph::empty(store_prefix.clone())),
+    )?;
+
+    // Test sync point: block until the named fifo is readable, so tests
+    // can deterministically exercise the early-socket window.
+    if let Ok(p) = std::env::var("_FAST_NIX_GC_TEST_SYNC_EARLY") {
+        let _ = fs::read(&p);
+    }
+
     log::info!("loading store graph...");
     let graph = Arc::new(db.load_graph()?);
     log::info!("{} total valid paths", graph.len());
 
-    // Start the gc-socket as soon as the graph is loaded so builders stop
-    // busy-polling gc.lock. Roots received only shrink the dead set.
+    // Phase 2: swap to the real server. Builders whose connection drops
+    // during the swap reconnect (Nix's addTempRoot restart loop).
+    drop(early_socket);
+    let early_roots = early_live.protected_unknown_snapshot();
     let live = Arc::new(LiveSet::new(graph.len()));
-    let _gc_socket = if dry_run {
-        None
-    } else {
-        Some(GcSocketServer::start(
-            &db.state_dir,
-            Arc::clone(&live),
-            Arc::clone(&graph),
-        )?)
-    };
+    let _gc_socket = start_socket(Arc::clone(&live), Arc::clone(&graph))?;
 
     let bidx = BasenameIndex::new(&graph);
+
+    // Replay phase-1 roots: known paths become ordinary GC roots (their
+    // closure stays alive), unknown basenames stay protected.
+    let mut early_root_idxs: Vec<u32> = Vec::new();
+    for b in &early_roots {
+        match bidx.idx_of_basename(b) {
+            Some(i) => early_root_idxs.push(i),
+            None => live.protect_unknown_basename(b),
+        }
+    }
 
     // A --store-dir that doesn't match the DB contents (wrong directory)
     // would make every root lookup miss and every DB path look dead,
@@ -183,6 +220,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
 
     log::info!("finding garbage collector roots...");
     let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx)?;
+    roots.extend(early_root_idxs);
 
     // Add temp roots. Some may reference paths registered after our
     // graph snapshot (a builder can register paths while we hold
@@ -275,15 +313,25 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
         let mut estimated = 0u64;
         let mut count = 0usize;
+        // Roots can arrive over the gc-socket while we run; a real GC
+        // would honor them, so the report must too.
+        let protected = live.protected_snapshot();
+        let protected_unknown = live.protected_unknown_snapshot();
         for &node in &dead_indices {
             if estimated >= max {
                 break;
+            }
+            if protected[node as usize] {
+                continue;
             }
             writeln!(stdout, "{}", graph.paths[node as usize])?;
             estimated += graph.nar_sizes[node as usize];
             count += 1;
         }
         for name in &unknown_on_disk {
+            if name.to_str().is_some_and(|n| protected_unknown.contains(n)) {
+                continue;
+            }
             writeln!(stdout, "{store_prefix}{}", name.display())?;
             count += 1;
         }

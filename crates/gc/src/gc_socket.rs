@@ -30,6 +30,9 @@ pub struct LiveSet {
 }
 
 struct LiveInner {
+    /// Set when the GC is tearing down (possibly on an error path with
+    /// unlinks still marked pending); protect() must stop waiting.
+    cancelled: bool,
     /// Per-node "do not delete" flag, indexed by graph node id.
     protected: Vec<bool>,
     /// Basenames protected that are not (yet) in the graph. Covers paths a
@@ -45,6 +48,7 @@ impl LiveSet {
     pub fn new(n_nodes: usize) -> Self {
         LiveSet {
             inner: Mutex::new(LiveInner {
+                cancelled: false,
                 protected: vec![false; n_nodes],
                 protected_unknown: HashSet::default(),
                 pending_nodes: HashSet::default(),
@@ -70,6 +74,26 @@ impl LiveSet {
         g.pending_nodes.remove(&node);
         drop(g);
         self.cond.notify_all();
+    }
+
+    /// Snapshot of per-node protection flags (dry-run reporting).
+    pub fn protected_snapshot(&self) -> Vec<bool> {
+        self.inner.lock().unwrap().protected.clone()
+    }
+
+    /// Snapshot of protected basenames that are not in the graph.
+    pub fn protected_unknown_snapshot(&self) -> HashSet<String> {
+        self.inner.lock().unwrap().protected_unknown.clone()
+    }
+
+    /// Mark a basename outside the graph as protected (used to carry
+    /// over roots received before the graph was loaded).
+    pub fn protect_unknown_basename(&self, basename: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .protected_unknown
+            .insert(basename.to_owned());
     }
 
     /// Atomically partition `nodes` into (claimed, skipped): skipped nodes
@@ -141,12 +165,22 @@ impl LiveSet {
             wait_for.iter().any(|n| g.pending_nodes.contains(n))
                 || g.pending_unknown.contains(basename)
         };
-        while conflict(&g) {
+        while conflict(&g) && !g.cancelled {
             log::debug!("synchronising with deletion of {basename}");
             g = self.cond.wait(g).unwrap();
         }
     }
+
+    /// Unblock every waiting protect(): used on GC teardown, where an
+    /// error path may leave pending nodes that will never finish.
+    fn cancel(&self) {
+        self.inner.lock().unwrap().cancelled = true;
+        self.cond.notify_all();
+    }
 }
+
+/// Client connections and their handler threads, owned by the server.
+type Conns = Arc<Mutex<Vec<(UnixStream, JoinHandle<()>)>>>;
 
 /// Running GC roots socket server. Dropping it tears down the listener,
 /// removes the socket file, and joins the accept thread.
@@ -154,6 +188,11 @@ pub struct GcSocketServer {
     socket_path: PathBuf,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    live: Arc<LiveSet>,
+    /// Live client connections; Drop shuts them down and joins their
+    /// handler threads so no `protect()` is still running afterwards —
+    /// callers snapshot the LiveSet right after dropping the server.
+    conns: Conns,
 }
 
 impl GcSocketServer {
@@ -180,18 +219,33 @@ impl GcSocketServer {
         }
         let idx = Arc::new(idx);
         let store_prefix = graph.store_prefix.clone();
+        let live_for_drop = Arc::clone(&live);
         let shutdown = Arc::new(AtomicBool::new(false));
         let accept_shutdown = Arc::clone(&shutdown);
+        let conns: Conns = Arc::new(Mutex::new(Vec::new()));
+        let accept_conns = Arc::clone(&conns);
 
         let handle = std::thread::Builder::new()
             .name("gc-socket".into())
-            .spawn(move || accept_loop(listener, store_prefix, live, graph, idx, accept_shutdown))
+            .spawn(move || {
+                accept_loop(
+                    listener,
+                    store_prefix,
+                    live,
+                    graph,
+                    idx,
+                    accept_shutdown,
+                    accept_conns,
+                )
+            })
             .context("spawning gc-socket thread")?;
 
         Ok(GcSocketServer {
             socket_path,
             shutdown,
             handle: Some(handle),
+            live: live_for_drop,
+            conns,
         })
     }
 }
@@ -203,6 +257,18 @@ impl Drop for GcSocketServer {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        // Force-close every client connection and join its handler. A
+        // mid-flight protect() finishes (its root is recorded) before the
+        // handler observes EOF/EPIPE and exits; unacked clients reconnect
+        // via Nix's addTempRoot restart loop. Cancel first so a protect()
+        // stuck on nodes an aborted deletion loop left pending cannot
+        // deadlock the join.
+        self.live.cancel();
+        let conns = std::mem::take(&mut *self.conns.lock().unwrap());
+        for (stream, handle) in conns {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            let _ = handle.join();
+        }
     }
 }
 
@@ -213,6 +279,7 @@ fn accept_loop(
     graph: Arc<StoreGraph>,
     idx: Arc<HashMap<String, u32>>,
     shutdown: Arc<AtomicBool>,
+    conns: Conns,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         let pfd = PollFd::new(listener.as_fd(), PollFlags::POLLIN);
@@ -232,15 +299,25 @@ fn accept_loop(
                 let live = Arc::clone(&live);
                 let graph = Arc::clone(&graph);
                 let idx = Arc::clone(&idx);
+                let Ok(stream2) = stream.try_clone() else {
+                    continue;
+                };
                 // Each builder keeps its connection open for the duration of
                 // its build; handle them concurrently.
-                let _ = std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("gc-socket-conn".into())
                     .spawn(move || {
                         if let Err(e) = handle_client(stream, &store_prefix, &live, &graph, &idx) {
                             log::debug!("gc-socket client: {e}");
                         }
                     });
+                if let Ok(handle) = spawned {
+                    let mut g = conns.lock().unwrap();
+                    // Drop entries whose handler already exited so the list
+                    // doesn't grow with every short-lived connection.
+                    g.retain(|(_, h)| !h.is_finished());
+                    g.push((stream2, handle));
+                }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) => {
@@ -458,6 +535,41 @@ mod tests {
         conn.set_read_timeout(None).unwrap();
         conn.read_exact(&mut ack).unwrap();
         assert_eq!(ack, [b'1']);
+    }
+
+    #[test]
+    fn drop_joins_handlers_and_snapshot_sees_acked_roots() {
+        // Phase-1/phase-2 swap in the GC: every root acked before the
+        // server is dropped must be visible in the snapshot taken right
+        // after, even though the client connection is still open (its
+        // handler thread must be terminated and joined, not detached).
+        let g = Arc::new(graph("/nix/store/", &[]));
+        let live = Arc::new(LiveSet::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let server = GcSocketServer::start(dir.path(), Arc::clone(&live), g).unwrap();
+        let sock = dir.path().join("gc-socket/socket");
+
+        let mut conn = UnixStream::connect(&sock).unwrap();
+        conn.write_all(b"/nix/store/early-root\n").unwrap();
+        let mut ack = [0u8; 1];
+        conn.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [b'1']);
+
+        // Handler is now blocked in read_line on the open connection;
+        // drop must not hang and must complete the handler first.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || {
+            drop(server);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("GcSocketServer::drop hung joining a live connection");
+        joiner.join().unwrap();
+
+        assert!(
+            live.protected_unknown_snapshot().contains("early-root"),
+            "acked root missing from post-drop snapshot"
+        );
     }
 
     #[test]

@@ -411,6 +411,18 @@ impl<'g> BasenameIndex<'g> {
 }
 
 impl StoreGraph {
+    /// Graph with no nodes, used while the real graph is still loading.
+    pub fn empty(store_prefix: String) -> StoreGraph {
+        StoreGraph {
+            paths: Vec::new(),
+            nar_sizes: Vec::new(),
+            registration_times: Vec::new(),
+            ref_offsets: vec![0],
+            ref_targets: Vec::new(),
+            store_prefix,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.paths.len()
     }
