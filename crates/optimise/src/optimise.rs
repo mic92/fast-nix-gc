@@ -145,7 +145,7 @@ impl Drop for ParentRestore<'_> {
     fn drop(&mut self) {
         if self.active {
             let _ = fs::set_permissions(self.dir, fs::Permissions::from_mode(0o555));
-            let _ = filetime_set_zero(self.dir);
+            let _ = set_mtime_to_one(self.dir);
         }
     }
 }
@@ -165,7 +165,7 @@ fn dir_mutex(dir: &Path) -> &'static std::sync::Mutex<()> {
     &pool[h as usize % SHARDS]
 }
 
-fn filetime_set_zero(path: &Path) -> std::io::Result<()> {
+fn set_mtime_to_one(path: &Path) -> std::io::Result<()> {
     use nix::sys::stat::{UtimensatFlags, utimensat};
     use nix::sys::time::TimeSpec;
     utimensat(
