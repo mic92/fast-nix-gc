@@ -170,9 +170,9 @@ re-parses the `.drv` at GC time, which fast-nix-gc doesn't do. With
 `keep-outputs = true` such a rooted derivation therefore does not keep
 its outputs alive. This only loses cache, the outputs stay
 rebuildable. Nix itself has no consistent behavior here: `--print-dead`,
-the real GC and repeat runs all disagree
-([nix#11923](https://github.com/NixOS/nix/issues/11923)). Revisit once
-upstream defines stable semantics.
+the real GC and repeat runs all disagree, since the re-parsing happens
+during the GC walk and is order-dependent. Revisit once upstream
+defines stable semantics.
 
 The GC takes the same `gc.lock` Nix does, so it won't race with
 `nix-build` or another GC. If interrupted mid-run the DB stays
