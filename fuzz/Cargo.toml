@@ -1,0 +1,33 @@
+[package]
+name = "fast-nix-gc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+fast-nix-gc = { path = "../crates/gc" }
+rusqlite = "0.39"
+
+[[bin]]
+name = "gc_graph"
+path = "fuzz_targets/gc_graph.rs"
+test = false
+doc = false
+bench = false
+
+# This crate is its own workspace (excluded from the root one), so the
+# harmonia git patch from the root manifest must be repeated here.
+[patch.crates-io]
+harmonia-file-core           = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-utils-io            = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-utils-base-encoding = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+harmonia-store-path-info     = { git = "https://github.com/nix-community/harmonia", rev = "9789e1d0a322360442ff2a2a150f8bd2b9ccf93a" }
+
+[profile.release]
+debug = 1

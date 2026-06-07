@@ -1,4 +1,9 @@
 /target
 result
-/.direnv
-/mutants.out*
+mutants.out*
+
+# cargo-fuzz build/run artifacts and ad-hoc corpus
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
+/fuzz/coverage

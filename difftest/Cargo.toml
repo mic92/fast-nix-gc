@@ -1,0 +1,16 @@
+[package]
+name = "fast-nix-gc-difftest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+pico-args.workspace = true
+rand = "0.9"
+rusqlite.workspace = true
+
+[[bin]]
+name = "fuzz-nix-diff"
+path = "src/main.rs"

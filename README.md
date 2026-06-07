@@ -128,6 +128,15 @@ or `nix develop -c cargo build --release`. Without flakes:
     cargo test       # against a synthetic store in a tempdir
     cargo bench      # throughput across several synthetic store sizes
 
+Two fuzzers back the behavioral claims below:
+
+    # differential: random store graphs, roots, configs and corruption
+    # vs nix-store --gc, deterministic per seed
+    cargo run --release --bin fuzz-nix-diff -- --iterations 20
+
+    # graph logic vs a reference model, no Nix (stable Rust)
+    cargo fuzz run -s none --fuzz-dir fuzz gc_graph
+
 ## Behavior
 
 Roots are gathered from `gcroots/`, `profiles/`, `temproots/`, and running
@@ -141,6 +150,29 @@ drv↔output mappings are read from `ValidPaths.deriver`,
 `DerivationOutputs`, and the `BuildTraceV3` table (Nix ≥2.35). The
 store is remounted read-write on NixOS where it's bind-mounted read-only.
 `tmp-*` build dirs are skipped if a builder still holds the lock.
+
+### Corrupted stores
+
+Disk and database can disagree after crashes or tampering. The GC
+repairs both directions: store entries without a database row are
+deleted, and rows whose disk entry is missing are removed once the path
+is garbage. Nix keeps a `.drv` row forever if its file is gone from
+disk, and if that path is reachable from a gcroot, `nix-store --gc`
+aborts entirely until the store is repaired by hand. fast-nix-gc
+decides liveness from the database alone and handles both.
+
+### Known limitation: keep-outputs with ca-derivations
+
+On Nix without the `BuildTraceV3` table (older than 2.35), a derivation
+depending on a floating content-addressed output has deferred output
+paths: nothing in the database links it to its outputs until Nix
+re-parses the `.drv` at GC time, which fast-nix-gc doesn't do. With
+`keep-outputs = true` such a rooted derivation therefore does not keep
+its outputs alive. This only loses cache, the outputs stay
+rebuildable. Nix itself has no consistent behavior here: `--print-dead`,
+the real GC and repeat runs all disagree
+([nix#11923](https://github.com/NixOS/nix/issues/11923)). Revisit once
+upstream defines stable semantics.
 
 The GC takes the same `gc.lock` Nix does, so it won't race with
 `nix-build` or another GC. If interrupted mid-run the DB stays

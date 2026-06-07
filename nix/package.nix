@@ -13,6 +13,7 @@ let
       ../Cargo.lock
       ../crates
       ../proptest
+      ../difftest
     ];
   };
 in

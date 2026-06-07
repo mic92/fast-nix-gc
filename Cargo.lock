@@ -365,6 +365,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast-nix-gc-difftest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pico-args",
+ "rand",
+ "rusqlite",
+]
+
+[[package]]
 name = "fast-nix-gc-proptest"
 version = "0.1.0"
 dependencies = [
