@@ -135,7 +135,7 @@ fn gen_graph(rng: &mut StdRng, keep_outputs: bool) -> Vec<Node> {
         // resolves drv -> output dynamically (the DB row has no path
         // until the resolved derivation registers it), and its real GC
         // is then order-dependent and disagrees with its own
-        // --print-dead (keep-outputs deletion cycles; nix#11923).
+        // --print-dead (keep-outputs deletion cycles).
         // There is no stable oracle to compare against.
         let no_drv_root = keep_outputs && deferred[i];
         if !node.kind.is_eval() && !no_drv_root && rng.random_bool(0.1) {
