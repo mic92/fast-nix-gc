@@ -123,6 +123,10 @@ pub struct GcOptions {
     pub max_freed: Option<u64>,
     /// Keep paths registered at or after this Unix timestamp.
     pub keep_recent_after: Option<i64>,
+    /// Skip the post-GC VACUUM. For busy builders, where concurrent
+    /// readers keep the VACUUM's database-sized WAL from being
+    /// truncated (the problem behind Nix commit 8299aaf).
+    pub no_vacuum: bool,
 }
 
 /// Main GC: find roots, compute alive closure, delete dead paths.
@@ -512,6 +516,14 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
 
     // Clean up unused hard links in .links
     let bytes_freed = bytes_freed + clean_links(&db.links_dir)?;
+
+    // Reclaim db space freed by the row deletions, still under the
+    // exclusive gc.lock. Best effort: a failed vacuum leaves the db valid.
+    if !opts.no_vacuum
+        && let Err(e) = db.maybe_vacuum()
+    {
+        log::warn!("vacuuming database failed: {e:#}");
+    }
 
     // Reclaim db space freed by the row deletions, still under the
     // exclusive gc.lock. Best effort: a failed vacuum leaves the db valid.

@@ -73,6 +73,16 @@ in
       '';
     };
 
+    noVacuum = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Skip the SQLite VACUUM after garbage collection. Enable on busy
+        builders, where concurrent nix-daemon readers prevent cleanup of
+        the database-sized WAL that VACUUM produces; see the README.
+      '';
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -174,6 +184,7 @@ in
               "--keep-recent"
               cfg.keepRecent
             ]
+            ++ lib.optional cfg.noVacuum "--no-vacuum"
             ++ cfg.extraArgs
           );
         };
