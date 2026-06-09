@@ -22,6 +22,7 @@ fast-nix-gc [OPTIONS]
       --dry-run                 Show what would be done
       --ensure-free SIZE        Free until SIZE is available (e.g. 50G)
       --keep-recent SPEC        Keep paths registered within SPEC (e.g. 1d)
+      --no-vacuum               Skip the database VACUUM after deletion
       --keep-outputs BOOL       Override the keep-outputs nix.conf setting
       --keep-derivations BOOL   Override the keep-derivations nix.conf setting
       --store-dir PATH          Nix store directory [default: /nix/store]
@@ -97,6 +98,7 @@ Replaces `nix.gc` and `nix.optimise`:
 | `deleteOlderThan` | `null` | Remove profile generations older than e.g. `"30d"` |
 | `ensureFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
 | `keepRecent` | `null` | Pin paths registered within e.g. `"1d"` |
+| `noVacuum` | `false` | Skip the post-GC database VACUUM (see below) |
 | `package` | this flake's package | Override the binary |
 | `extraArgs` | `[ ]` | Extra CLI arguments |
 
@@ -115,6 +117,19 @@ Replaces `nix.gc` and `nix.optimise`:
 | `extraArgs` | `[ ]` | Extra CLI arguments |
 
 Without flakes, import `nix/module.nix` directly.
+
+### When to use `--no-vacuum` / `noVacuum`
+
+After deleting dead paths, fast-nix-gc runs `VACUUM` when at least a
+quarter of the database is free pages. In WAL mode this rewrites the
+entire database through the write-ahead log, and SQLite cannot truncate
+the resulting database-sized `db.sqlite-wal` while any connection holds
+a read snapshot. This is the reason Nix disabled GC vacuuming in commit
+[`8299aaf`](https://github.com/NixOS/nix/commit/8299aaf07988a3ca7ecda3526b7e25a885550db5).
+
+On builders that are never idle, enable `--no-vacuum`: the free pages
+stay in `db.sqlite` and are reused for new registrations, and a later GC
+on a quiet system reclaims the space.
 
 ## Building
 

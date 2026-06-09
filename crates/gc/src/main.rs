@@ -10,6 +10,7 @@ struct Args {
     dry_run: bool,
     ensure_free: Option<u64>,
     keep_recent: Option<String>,
+    no_vacuum: bool,
     keep_outputs: Option<bool>,
     keep_derivations: Option<bool>,
     store_dir: PathBuf,
@@ -57,6 +58,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         println!("      --dry-run                 Show what would be done");
         println!("      --ensure-free SIZE        Free until SIZE is available (e.g. 50G)");
         println!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
+        println!("      --no-vacuum               Skip the database VACUUM after deletion");
         println!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
         println!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
         println!("      --store-dir PATH          Nix store directory [default: /nix/store]");
@@ -74,6 +76,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         dry_run: pargs.contains("--dry-run"),
         ensure_free: pargs.opt_value_from_fn("--ensure-free", parse_size)?,
         keep_recent: pargs.opt_value_from_str("--keep-recent")?,
+        no_vacuum: pargs.contains("--no-vacuum"),
         keep_outputs: pargs.opt_value_from_str("--keep-outputs")?,
         keep_derivations: pargs.opt_value_from_str("--keep-derivations")?,
         store_dir: pargs
@@ -94,6 +97,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
             "--dry-run",
             "--ensure-free",
             "--keep-recent",
+            "--no-vacuum",
             "--keep-outputs",
             "--keep-derivations",
             "--store-dir",
@@ -186,6 +190,7 @@ fn main() -> Result<()> {
         dry_run: args.dry_run,
         max_freed,
         keep_recent_after,
+        no_vacuum: args.no_vacuum,
     };
     let (bytes_freed, paths_deleted) = gc::collect_garbage(&store, &opts)?;
 
