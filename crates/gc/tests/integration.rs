@@ -1224,3 +1224,25 @@ fn gc_socket_root_mid_gc_keeps_path_and_deletes_rest() {
     assert!(!other.path.exists(), "other survived");
     assert!(!store.in_db(&other));
 }
+
+#[test]
+fn gc_vacuums_db_after_mass_deletion() {
+    let store = TestStore::new();
+    // Enough rows that deleting them leaves a freelist big enough to
+    // trip the auto-vacuum heuristic (>25% free pages, >=64 pages).
+    for i in 0..5000 {
+        store.add_path(&format!("dead-{i}-padpadpadpadpadpadpadpadpad"), 1);
+    }
+    let db_path = store.state_dir.join("db/db.sqlite");
+    let before = fs::metadata(&db_path).unwrap().len();
+
+    let out = store.run_gc_ok(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("vacuum"), "stderr: {stderr}");
+
+    let after = fs::metadata(&db_path).unwrap().len();
+    assert!(
+        after < before / 2,
+        "db not vacuumed: before={before} after={after}"
+    );
+}

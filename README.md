@@ -151,6 +151,16 @@ drv↔output mappings are read from `ValidPaths.deriver`,
 store is remounted read-write on NixOS where it's bind-mounted read-only.
 `tmp-*` build dirs are skipped if a builder still holds the lock.
 
+### Database vacuum
+
+SQLite never shrinks `db.sqlite` on its own, so after deletion the GC
+runs `VACUUM` when at least 25% of the file is free pages, still under
+the exclusive `gc.lock`. VACUUM is atomic: if it fails (e.g. out of
+disk for the temp copy) the database stays valid and the next GC
+retries. On a real-world 648 MB database that was 63% free pages,
+vacuuming shrank it to 216 MB and made the cold-cache graph load 4x
+faster (whole dry-run: 2.4x).
+
 ### Corrupted stores
 
 Disk and database can disagree after crashes or tampering. The GC
