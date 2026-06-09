@@ -349,6 +349,27 @@ impl NixDb {
             }
         }
     }
+
+    /// VACUUM if enough of the file is free pages to be worth a full
+    /// rewrite: at least a quarter of the file and at least 64 pages
+    /// (256 KiB at the default page size). The caller must hold the
+    /// exclusive gc.lock so no Nix writer collides; concurrent readers
+    /// are fine in WAL mode. Returns whether a vacuum ran.
+    pub fn maybe_vacuum(&self) -> Result<bool> {
+        let freelist: i64 = self
+            .conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let pages: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        if freelist < 64 || freelist * 4 < pages {
+            return Ok(false);
+        }
+        log::info!("vacuuming database ({freelist} of {pages} pages free)...");
+        self.conn.execute_batch("VACUUM")?;
+        // Best effort: a concurrent reader may block the WAL truncate;
+        // the next checkpoint picks it up.
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        Ok(true)
+    }
 }
 
 /// Strip trailing slashes (but keep a bare "/").
@@ -533,6 +554,13 @@ mod tests {
                 rusqlite::params![referrer, reference],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn maybe_vacuum_skips_small_freelist() {
+        let t = setup();
+        add_path(&t.db, &format!("{H1}-a"), 1, 1);
+        assert!(!t.db.maybe_vacuum().unwrap());
     }
 
     #[test]
