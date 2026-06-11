@@ -525,12 +525,6 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         log::warn!("vacuuming database failed: {e:#}");
     }
 
-    // Reclaim db space freed by the row deletions, still under the
-    // exclusive gc.lock. Best effort: a failed vacuum leaves the db valid.
-    if let Err(e) = db.maybe_vacuum() {
-        log::warn!("vacuuming database failed: {e:#}");
-    }
-
     Ok((bytes_freed, paths_deleted))
 }
 
