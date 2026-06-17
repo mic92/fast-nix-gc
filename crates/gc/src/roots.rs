@@ -93,47 +93,7 @@ fn find_roots_in_dir(
                     roots.insert(idx);
                 }
             } else {
-                // Indirect root: symlink -> symlink -> store.
-                // Nix's findRoots resolves at most one extra hop. Use
-                // symlink_metadata to avoid recursive follow / symlink loops.
-                let abs_target = if target.is_absolute() {
-                    target.clone()
-                } else {
-                    dir.join(&target)
-                };
-                // metadata() (stat, follows) returns ENOENT for dangling
-                // links and ELOOP for cycles — both are "target gone".
-                // Any other error (EACCES, EIO) says nothing about the
-                // target's existence: removing the root then would let the
-                // GC delete a live path.
-                if let Err(e) = fs::metadata(&abs_target) {
-                    let target_gone = e.kind() == std::io::ErrorKind::NotFound
-                        || e.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32);
-                    if !target_gone {
-                        return Err(e).with_context(|| format!("stat {}", abs_target.display()));
-                    }
-                    // Component match, not substring: "gcroots/automatic"
-                    // must not qualify.
-                    if dir.ends_with("gcroots/auto") {
-                        log::debug!("removing stale link {}", path.display());
-                        fs::remove_file(&path).ok();
-                    }
-                    continue;
-                }
-                if abs_target
-                    .symlink_metadata()
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-                    && let Ok(target2) = fs::read_link(&abs_target)
-                {
-                    let t2_str = target2.to_string_lossy();
-                    if is_in_store(store_prefix, &t2_str)
-                        && let Some(sp) = extract_store_path(store_prefix, &t2_str)
-                        && let Some(idx) = idx.idx_of(&sp)
-                    {
-                        roots.insert(idx);
-                    }
-                }
+                resolve_indirect_root(dir, &path, &target, store_prefix, idx, roots)?;
             }
         } else if meta.file_type().is_dir() {
             find_roots_in_dir(&path, store_prefix, idx, roots)?;
@@ -147,6 +107,75 @@ fn find_roots_in_dir(
         }
     }
     Ok(())
+}
+
+/// Indirect root: symlink -> symlink -> store. Nix's findRoots resolves at
+/// most one extra hop. Resolve it with lstat + readlink, never a following
+/// stat(): under fs.protected_symlinks, following a user-owned link in a
+/// sticky directory like /tmp fails with EACCES, even for root.
+fn resolve_indirect_root(
+    dir: &Path,
+    link: &Path,
+    target: &Path,
+    store_prefix: &str,
+    idx: &BasenameIndex,
+    roots: &mut HashSet<u32>,
+) -> Result<()> {
+    let abs_target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        dir.join(target)
+    };
+    let target_meta = match fs::symlink_metadata(&abs_target) {
+        Ok(m) => m,
+        // First hop gone: the indirect root was removed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            remove_stale_auto_link(dir, link);
+            return Ok(());
+        }
+        // EACCES/EIO say nothing about the target's existence:
+        // dropping the root could let the GC delete a live path.
+        Err(e) => {
+            return Err(e).with_context(|| format!("stat {}", abs_target.display()));
+        }
+    };
+    if !target_meta.file_type().is_symlink() {
+        // Plain file or directory: not an indirect store root.
+        return Ok(());
+    }
+    let target2 = match fs::read_link(&abs_target) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("readlink {}", abs_target.display()));
+        }
+    };
+    if let Some(sp) = extract_store_path(store_prefix, &target2.to_string_lossy())
+        && let Some(idx) = idx.idx_of(&sp)
+    {
+        roots.insert(idx);
+        return Ok(());
+    }
+    // No live root behind the link. Clean dangling auto links, but only when
+    // the second hop provably does not exist: EACCES/EIO prove nothing.
+    let abs_target2 = if target2.is_absolute() {
+        target2
+    } else {
+        abs_target.parent().unwrap_or(Path::new("/")).join(target2)
+    };
+    if fs::symlink_metadata(&abs_target2).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        remove_stale_auto_link(dir, link);
+    }
+    Ok(())
+}
+
+/// Remove a dangling link in gcroots/auto. Component match, not substring:
+/// "gcroots/automatic" must not qualify.
+fn remove_stale_auto_link(dir: &Path, link: &Path) {
+    if dir.ends_with("gcroots/auto") {
+        log::debug!("removing stale link {}", link.display());
+        fs::remove_file(link).ok();
+    }
 }
 
 /// Extract the top-level store path from a potentially deeper path.

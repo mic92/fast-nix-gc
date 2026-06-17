@@ -1008,6 +1008,69 @@ fn gc_keeps_auto_root_with_unreadable_target() {
 }
 
 #[test]
+fn gc_keeps_indirect_auto_root() {
+    // auto link -> user symlink -> store path. This covers ordinary
+    // indirect-root retention; the next test covers an unfollowable second hop,
+    // which is the property protected_symlinks exposes in practice.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    let auto = store.state_dir.join("gcroots/auto");
+    fs::create_dir_all(&auto).unwrap();
+    let user_link = store.dir.path().join("result");
+    std::os::unix::fs::symlink(&lib.path, &user_link).unwrap();
+    std::os::unix::fs::symlink(&user_link, auto.join("x0")).unwrap();
+
+    store.run_gc_ok(&[]);
+
+    assert!(
+        lib.path.exists() && store.in_db(&lib),
+        "indirect root deleted"
+    );
+    assert!(
+        auto.join("x0").symlink_metadata().is_ok(),
+        "live auto root removed"
+    );
+}
+
+#[test]
+fn gc_scans_roots_despite_unfollowable_indirect_target() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix::unistd::geteuid().is_root() {
+        return; // root bypasses permission checks
+    }
+    // A readable link whose target only fails to resolve *through* it
+    // (here: second hop in a mode-000 dir, standing in for
+    // fs.protected_symlinks, which a test cannot flip) is provably not a
+    // store root — the scan must carry on, not abort.
+    let store = TestStore::new();
+    let lib = store.add_path("lib", 100);
+    store.add_root("keep", &lib);
+    let auto = store.state_dir.join("gcroots/auto");
+    fs::create_dir_all(&auto).unwrap();
+    let private = store.dir.path().join("private");
+    fs::create_dir_all(&private).unwrap();
+    fs::write(private.join("notes"), "").unwrap();
+    let user_link = store.dir.path().join("result");
+    std::os::unix::fs::symlink(private.join("notes"), &user_link).unwrap();
+    std::os::unix::fs::symlink(&user_link, auto.join("x0")).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = store.run_gc(&[]);
+
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        out.status.success(),
+        "scan aborted on unfollowable non-store target: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(lib.path.exists() && store.in_db(&lib), "live path deleted");
+    assert!(
+        auto.join("x0").symlink_metadata().is_ok(),
+        "auto root with unprovable target removed"
+    );
+}
+
+#[test]
 fn gc_removes_dangling_auto_root() {
     let store = TestStore::new();
     let auto = store.state_dir.join("gcroots/auto");
