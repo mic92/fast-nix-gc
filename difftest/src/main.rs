@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result, bail};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
