@@ -1059,6 +1059,9 @@ fn gc_keeps_lock_file_of_active_build() {
     drop(lock);
 }
 
+// APFS rejects non-UTF-8 file names (EILSEQ), so this scenario can only be
+// constructed on Linux.
+#[cfg(target_os = "linux")]
 #[test]
 fn gc_deletes_non_utf8_store_entry() {
     use std::os::unix::ffi::OsStrExt;
