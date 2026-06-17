@@ -487,7 +487,14 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
                 return;
             }
             let real_path = real_store_dir.join(raw);
-            let _tmp_lock = if name.starts_with("tmp-") {
+            // Only a directory can be a build temp dir a builder still holds;
+            // a stray tmp-* FIFO would fail flock() on macOS and be kept forever.
+            let is_locked_candidate = name.starts_with("tmp-")
+                && real_path
+                    .symlink_metadata()
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+            let _tmp_lock = if is_locked_candidate {
                 match try_lock_dir(&real_path) {
                     Some(f) => Some(f),
                     None => {
