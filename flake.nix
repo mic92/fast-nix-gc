@@ -6,7 +6,12 @@
   };
 
   outputs =
-    { nixpkgs, treefmt-nix, ... }:
+    {
+      self,
+      nixpkgs,
+      treefmt-nix,
+      ...
+    }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [
         "x86_64-linux"
@@ -43,10 +48,10 @@
         in
         {
           proptest = pkgs.callPackage ./nix/proptest.nix { };
-        }
-        // {
           treefmt = (import ./nix/treefmt.nix { inherit pkgs treefmt-nix; }).config.build.check ./.;
         }
+        // nixpkgs.lib.mapAttrs' (n: nixpkgs.lib.nameValuePair "package-${n}") self.packages.${system}
+        // nixpkgs.lib.mapAttrs' (n: nixpkgs.lib.nameValuePair "devshell-${n}") self.devShells.${system}
         // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-test = import ./nix/nixos-test.nix { inherit pkgs; };
         }
