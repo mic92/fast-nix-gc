@@ -83,6 +83,16 @@ in
       '';
     };
 
+    chunkSize = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      description = ''
+        Number of dead paths invalidated per database transaction. Lower
+        values keep the WAL (and its disk use) smaller during deletion at
+        the cost of more checkpoints; null uses the default (65536).
+      '';
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -185,6 +195,10 @@ in
               cfg.keepRecent
             ]
             ++ lib.optional cfg.noVacuum "--no-vacuum"
+            ++ lib.optionals (cfg.chunkSize != null) [
+              "--chunk-size"
+              (toString cfg.chunkSize)
+            ]
             ++ cfg.extraArgs
           );
         };

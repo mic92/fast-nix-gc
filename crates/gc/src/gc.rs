@@ -127,6 +127,10 @@ pub struct GcOptions {
     /// readers keep the VACUUM's database-sized WAL from being
     /// truncated (the problem behind Nix commit 8299aaf).
     pub no_vacuum: bool,
+    /// Max dead paths invalidated per DB transaction. Smaller keeps the
+    /// WAL (and its disk use) lower; larger means fewer checkpoints.
+    /// None uses the default.
+    pub chunk_size: Option<usize>,
 }
 
 /// Main GC: find roots, compute alive closure, delete dead paths.
@@ -399,7 +403,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
 
     // Commit in bounded chunks, truncating the WAL after each, so disk use
     // stays bounded and space is reclaimed incrementally.
-    const MAX_CHUNK: usize = 65_536;
+    let max_chunk = opts.chunk_size.unwrap_or(65_536).max(1);
     let mut cursor = 0usize;
     while cursor < order.len() {
         let freed_so_far = bytes_freed.load(Ordering::Relaxed);
@@ -416,7 +420,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         let take_all = cursor >= acyclic_len;
         while cursor < order.len()
             && (take_all
-                || (cursor < acyclic_len && estimated < remaining && chunk.len() < MAX_CHUNK))
+                || (cursor < acyclic_len && estimated < remaining && chunk.len() < max_chunk))
         {
             let node = order[cursor];
             cursor += 1;

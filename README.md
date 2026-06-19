@@ -23,6 +23,7 @@ fast-nix-gc [OPTIONS]
       --ensure-free SIZE        Free until SIZE is available (e.g. 50G)
       --keep-recent SPEC        Keep paths registered within SPEC (e.g. 1d)
       --no-vacuum               Skip the database VACUUM after deletion
+      --chunk-size N            Dead paths per delete transaction [default: 65536]
       --keep-outputs BOOL       Override the keep-outputs nix.conf setting
       --keep-derivations BOOL   Override the keep-derivations nix.conf setting
       --store-dir PATH          Nix store directory [default: /nix/store]
@@ -99,6 +100,7 @@ Replaces `nix.gc` and `nix.optimise`:
 | `ensureFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
 | `keepRecent` | `null` | Pin paths registered within e.g. `"1d"` |
 | `noVacuum` | `false` | Skip the post-GC database VACUUM (see below) |
+| `chunkSize` | `null` | Dead paths per delete transaction (default 65536) |
 | `package` | this flake's package | Override the binary |
 | `extraArgs` | `[ ]` | Extra CLI arguments |
 
