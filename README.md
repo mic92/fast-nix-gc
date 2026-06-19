@@ -133,6 +133,35 @@ On builders that are never idle, enable `--no-vacuum`: the free pages
 stay in `db.sqlite` and are reused for new registrations, and a later GC
 on a quiet system reclaims the space.
 
+### Tuning `--chunk-size` / `chunkSize`
+
+Dead paths are invalidated in batches, one SQLite transaction per batch,
+with the write-ahead log truncated after each. The batch size trades disk
+headroom against checkpoint overhead:
+
+- **Smaller** keeps each transaction's `db.sqlite-wal` small. A single
+  transaction over the whole dead set grows the WAL until commit.
+  On a full disk that aborts with `SQLITE_FULL` and frees nothing.
+  Chunking bounds the WAL and reclaims space incrementally.
+- **Larger** means fewer transactions and fewer checkpoint `fsync`s, so
+  deletion runs faster, at the cost of a larger transient WAL.
+
+As a rule of thumb, deleting a path dirties scattered B-tree pages across
+the references table and its indexes, costing very roughly 10 KiB of WAL
+per dead path on a large, cold store, so a batch's WAL is about
+`chunk-size × 10 KiB`. The default of 65536 keeps it near 640 MiB, safe on
+all but a nearly full disk. With tens of GiB free, `--chunk-size 262144`
+(~2.5 GiB WAL) cuts the checkpoint count ~4x.
+Only higher when you have enough free disk space,
+since the WAL grows linearly with the batch size.
+
+The truncation after each batch can only reclaim WAL frames older than the
+oldest live read snapshot. A long-running reader i.e. `nix-daemon` pins those frames,
+so the WAL keeps growing across batches regardless of `--chunk-size`, potentially until the disk fills.
+For a large GC on a tight disk stop `nix-daemon` (and any other store reader) first, or
+keep the chunk size small enough that even an unreclaimed WAL fits the free
+space.
+
 ## Building
 
     nix build
