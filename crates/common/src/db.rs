@@ -365,6 +365,11 @@ impl NixDb {
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT")?;
+                // Truncate the WAL back to the main db so its disk use
+                // doesn't accumulate across chunks. On a full disk an
+                // unbounded WAL would abort a later chunk. Best effort:
+                // a blocked checkpoint just leaves the WAL for the next.
+                let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
                 Ok(())
             }
             Err(e) => {
