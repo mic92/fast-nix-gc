@@ -119,6 +119,7 @@ impl NixDb {
         let mut ids: Vec<i64> = Vec::new();
         let mut nar_sizes: Vec<u64> = Vec::new();
         let mut registration_times: Vec<i64> = Vec::new();
+        let t_nodes = std::time::Instant::now();
         {
             let mut stmt = self
                 .conn
@@ -140,12 +141,21 @@ impl NixDb {
             }
         }
 
+        log::debug!(
+            "loaded {} nodes in {:.1}s",
+            paths.len(),
+            t_nodes.elapsed().as_secs_f64()
+        );
+
         // CSR adjacency: flat target array + per-node offsets.
         let n = paths.len();
         let mut edges: Vec<(u32, u32)> = Vec::new();
+        let t_edges = std::time::Instant::now();
 
         let mut add_edges =
             |conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<()> {
+                let start = std::time::Instant::now();
+                let before = edges.len();
                 let mut stmt = conn.prepare(sql)?;
                 let mut rows = stmt.query(params)?;
                 while let Some(row) = rows.next()? {
@@ -157,6 +167,11 @@ impl NixDb {
                         edges.push((from, to));
                     }
                 }
+                log::debug!(
+                    "edge query took {:.1}s ({} edges): {sql}",
+                    start.elapsed().as_secs_f64(),
+                    edges.len() - before,
+                );
                 Ok(())
             };
 
@@ -229,6 +244,12 @@ impl NixDb {
                 )?;
             }
         }
+
+        log::debug!(
+            "loaded {} edges in {:.1}s",
+            edges.len(),
+            t_edges.elapsed().as_secs_f64()
+        );
 
         // CSR offsets are u32; refuse to build a graph the index type
         // cannot address instead of silently wrapping.
@@ -367,10 +388,12 @@ impl NixDb {
             return Ok(false);
         }
         log::info!("vacuuming database ({freelist} of {pages} pages free)...");
+        let start = std::time::Instant::now();
         self.conn.execute_batch("VACUUM")?;
         // Best effort: a concurrent reader may block the WAL truncate;
         // the next checkpoint picks it up.
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        log::info!("vacuum done in {:.1}s", start.elapsed().as_secs_f64());
         Ok(true)
     }
 }
