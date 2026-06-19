@@ -116,6 +116,7 @@ impl NixDb {
         let mut id_to_idx = vec![MISSING; (max_id as usize) + 1];
 
         let mut paths: Vec<String> = Vec::new();
+        let mut ids: Vec<i64> = Vec::new();
         let mut nar_sizes: Vec<u64> = Vec::new();
         let mut registration_times: Vec<i64> = Vec::new();
         {
@@ -133,6 +134,7 @@ impl NixDb {
                     id_to_idx[id as usize] = idx;
                 }
                 paths.push(path);
+                ids.push(id);
                 nar_sizes.push(nar.unwrap_or(0).max(0) as u64);
                 registration_times.push(reg_time);
             }
@@ -252,6 +254,7 @@ impl NixDb {
 
         Ok(StoreGraph {
             paths,
+            ids,
             nar_sizes,
             registration_times,
             ref_offsets,
@@ -292,23 +295,23 @@ impl NixDb {
         Ok(n > 0)
     }
 
-    /// Remove paths from the DB in a single transaction.
-    pub fn invalidate_paths<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
+    /// Remove paths by their ValidPaths.id in a single transaction. The
+    /// caller holds the ids from `load_graph`, so deletion is a rowid
+    /// insert into DeadPaths rather than a per-path index lookup.
+    pub fn invalidate_ids(&self, ids: impl Iterator<Item = i64>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<()> {
-            // Collect the ids of paths to delete into a temp table so
-            // we can batch-delete their Refs in two statements instead
-            // of one subquery per path.
+            // Collect the dead ids in a temp table so their Refs can be
+            // batch-deleted in two statements instead of one subquery
+            // per path.
             self.conn.execute_batch(
                 "CREATE TEMP TABLE IF NOT EXISTS DeadPaths (id INTEGER PRIMARY KEY)",
             )?;
             self.conn.execute_batch("DELETE FROM DeadPaths")?;
             {
-                let mut ins = self
-                    .conn
-                    .prepare("INSERT INTO DeadPaths SELECT id FROM ValidPaths WHERE path = ?")?;
-                for p in paths {
-                    ins.execute([p])?;
+                let mut ins = self.conn.prepare("INSERT INTO DeadPaths VALUES (?)")?;
+                for id in ids {
+                    ins.execute([id])?;
                 }
             }
             // Delete reference edges involving dead paths first.
@@ -387,6 +390,9 @@ fn normalize_dir(dir: &Path) -> PathBuf {
 pub struct StoreGraph {
     /// node idx -> store path string
     pub paths: Vec<String>,
+    /// node idx -> ValidPaths.id (DB primary key). Lets invalidation
+    /// delete by rowid instead of re-resolving each path string.
+    pub ids: Vec<i64>,
     /// node idx -> narSize (bytes)
     pub nar_sizes: Vec<u64>,
     /// node idx -> registrationTime (Unix epoch seconds)
@@ -436,6 +442,7 @@ impl StoreGraph {
     pub fn empty(store_prefix: String) -> StoreGraph {
         StoreGraph {
             paths: Vec::new(),
+            ids: Vec::new(),
             nar_sizes: Vec::new(),
             registration_times: Vec::new(),
             ref_offsets: vec![0],
@@ -745,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_paths_handles_ref_cycles() {
+    fn invalidate_ids_handles_ref_cycles() {
         let t = setup();
         let a = add_path(&t.db, &format!("{H1}-a"), 1, 1);
         let b = add_path(&t.db, &format!("{H2}-b"), 1, 1);
@@ -755,9 +762,7 @@ mod tests {
         add_ref(&t.db, a, b);
         add_ref(&t.db, b, a);
 
-        let dead = [full(&format!("{H1}-a")), full(&format!("{H2}-b"))];
-        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
-            .unwrap();
+        t.db.invalidate_ids([a, b].into_iter()).unwrap();
 
         let remaining: Vec<String> =
             t.db.valid_store_paths()
@@ -774,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_paths_cascades_derivation_outputs() {
+    fn invalidate_ids_cascades_derivation_outputs() {
         let t = setup();
         let drv = add_path(&t.db, &format!("{H1}-pkg.drv"), 1, 1);
         let out = add_path(&t.db, &format!("{H2}-pkg"), 1, 1);
@@ -786,9 +791,7 @@ mod tests {
             .unwrap();
         let _ = out;
 
-        let dead = [full(&format!("{H1}-pkg.drv"))];
-        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
-            .unwrap();
+        t.db.invalidate_ids([drv].into_iter()).unwrap();
 
         let n: i64 =
             t.db.conn
@@ -798,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_paths_clears_realisations_with_restrict_fk() {
+    fn invalidate_ids_clears_realisations_with_restrict_fk() {
         // Nix ≤2.34 CA schema: RealisationsRefs.realisationReference is ON
         // DELETE RESTRICT. Bulk-deleting two dead paths whose realisations
         // reference each other must not trip the constraint.
@@ -830,9 +833,7 @@ mod tests {
             ))
             .unwrap();
 
-        let dead = [full(&format!("{H1}-a")), full(&format!("{H2}-b"))];
-        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
-            .unwrap();
+        t.db.invalidate_ids([a, b].into_iter()).unwrap();
 
         for table in ["Realisations", "RealisationsRefs", "ValidPaths"] {
             let n: i64 =

@@ -436,7 +436,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         // Invalidate rows before unlinking: builders trust isValidPath(),
         // so a path must never look valid after its disk entry is gone.
         // See alloy/gc_db_consistency.als.
-        db.invalidate_paths(claimed.iter().map(|&n| graph.paths[n as usize].as_str()))?;
+        db.invalidate_ids(claimed.iter().map(|&n| graph.ids[n as usize]))?;
         claimed.par_iter().for_each(|&node| {
             let path = &graph.paths[node as usize];
             let basename = path.strip_prefix(&store_prefix).unwrap_or(path);

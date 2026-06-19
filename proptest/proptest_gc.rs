@@ -156,15 +156,16 @@ proptest! {
         }
 
         // Invalidation must not violate FK constraints (cycles etc.)
-        let dead_paths: Vec<String> = (0..n)
+        let dead_ids: Vec<i64> = (0..n)
             .filter(|&i| !expected[i])
-            .map(|i| {
+            .filter_map(|i| {
                 let hash = fake_hash(i);
-                format!("{}/{hash}-pkg-{i}", store_dir.display())
+                let full = format!("{}/{hash}-pkg-{i}", store_dir.display());
+                bidx.idx_of(&full).map(|idx| graph.ids[idx as usize])
             })
             .collect();
 
-        db.invalidate_paths(dead_paths.iter().map(|s| s.as_str())).unwrap();
+        db.invalidate_ids(dead_ids.into_iter()).unwrap();
 
         // Verify DB state
         let remaining: Vec<String> = {
