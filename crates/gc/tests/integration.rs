@@ -503,6 +503,39 @@ fn gc_max_freed_referrer_never_outlives_reference() {
 }
 
 #[test]
+fn gc_chunk_size_one_deletes_whole_dead_chain() {
+    use fast_nix_gc::{
+        db::NixDb,
+        gc::{GcOptions, collect_garbage},
+    };
+    let store = TestStore::new();
+    // A reference chain a -> b -> c, all dead. With one path per
+    // transaction, referrer-first order must still delete every node and
+    // never leave a surviving referrer pointing at a deleted reference.
+    let c = store.add_path("dead-c", 100);
+    let b = store.add_path("dead-b", 100);
+    let a = store.add_path("dead-a", 100);
+    store.add_ref(&a, &b);
+    store.add_ref(&b, &c);
+
+    let nix_db = NixDb::open(&store.store_dir, &store.state_dir).unwrap();
+    let opts = GcOptions {
+        chunk_size: Some(1),
+        ..Default::default()
+    };
+    collect_garbage(&nix_db, &opts).unwrap();
+
+    for p in [&a, &b, &c] {
+        assert!(!p.path.exists(), "{} should be GC'd", p.full);
+    }
+    let conn = store.db();
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ValidPaths", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0, "all dead paths should be invalidated");
+}
+
+#[test]
 fn gc_keep_recent_pins_recently_registered() {
     use fast_nix_gc::{
         db::NixDb,

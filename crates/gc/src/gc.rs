@@ -127,6 +127,10 @@ pub struct GcOptions {
     /// readers keep the VACUUM's database-sized WAL from being
     /// truncated (the problem behind Nix commit 8299aaf).
     pub no_vacuum: bool,
+    /// Max dead paths invalidated per DB transaction. Smaller keeps the
+    /// WAL (and its disk use) lower; larger means fewer checkpoints.
+    /// None uses the default.
+    pub chunk_size: Option<usize>,
 }
 
 /// Main GC: find roots, compute alive closure, delete dead paths.
@@ -357,29 +361,51 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     let bytes_freed = AtomicU64::new(0);
     let paths_deleted = AtomicU64::new(0);
 
-    // Reverse edges among dead paths. A chunk has to take the dead
-    // referrers of everything it invalidates with it, otherwise a
-    // surviving row keeps references to deleted rows. Only needed when
-    // --ensure-free splits deletion into chunks; a single chunk is the
-    // whole dead set. Alive paths never reference dead ones.
-    let dead_referrers: Option<Vec<Vec<u32>>> = max_freed.map(|_| {
-        let mut rev = vec![Vec::new(); graph.len()];
-        for &n in &dead_indices {
-            for &m in graph.refs(n) {
-                if !alive[m as usize] && m != n {
-                    rev[m as usize].push(n);
-                }
+    // Referrer-first deletion order (Kahn over the dead subgraph), so
+    // every prefix is safe to commit: still-valid paths never reference an
+    // already-deleted one. in_degree counts a dead node's dead referrers
+    // (graph.refs(r) lists what r references, so an edge r->m makes r a
+    // referrer of m).
+    let dead_ref = |node: u32, m: u32| m != node && !alive[m as usize];
+    let mut in_degree = vec![0u32; graph.len()];
+    for &node in &dead_indices {
+        for &m in graph.refs(node).iter().filter(|&&m| dead_ref(node, m)) {
+            in_degree[m as usize] += 1;
+        }
+    }
+    let mut order: Vec<u32> = dead_indices
+        .iter()
+        .copied()
+        .filter(|&m| in_degree[m as usize] == 0)
+        .collect();
+    let mut head = 0;
+    while head < order.len() {
+        let node = order[head];
+        head += 1;
+        for &m in graph.refs(node).iter().filter(|&&m| dead_ref(node, m)) {
+            in_degree[m as usize] -= 1;
+            if in_degree[m as usize] == 0 {
+                order.push(m);
             }
         }
-        rev
-    });
+    }
+    // Cyclic nodes never reach in-degree 0. They are mutually dependent,
+    // so they share one trailing chunk that is never split.
+    let acyclic_len = order.len();
+    if order.len() < dead_indices.len() {
+        order.extend(
+            dead_indices
+                .iter()
+                .copied()
+                .filter(|&m| in_degree[m as usize] != 0),
+        );
+    }
 
-    // Fill each chunk by cumulative narSize up to the remaining --ensure-free
-    // budget, then re-check actual freed bytes (narSize over-reports for
-    // hard-linked paths). Without --ensure-free, max is u64::MAX: one chunk.
-    let mut in_chunk = vec![false; graph.len()];
+    // Commit in bounded chunks, truncating the WAL after each, so disk use
+    // stays bounded and space is reclaimed incrementally.
+    let max_chunk = opts.chunk_size.unwrap_or(65_536).max(1);
     let mut cursor = 0usize;
-    while cursor < dead_indices.len() {
+    while cursor < order.len() {
         let freed_so_far = bytes_freed.load(Ordering::Relaxed);
         if freed_so_far >= max {
             log::info!("deleted more than {max} bytes; stopping");
@@ -387,31 +413,22 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         }
         let remaining = max - freed_so_far;
         let mut chunk: Vec<u32> = Vec::new();
+        // narSize over-reports hard-linked paths, so estimated only
+        // bounds the chunk; actual freed bytes are re-checked above.
         let mut estimated = 0u64;
-        while cursor < dead_indices.len() && estimated < remaining {
-            let n = dead_indices[cursor];
+        // Take the cyclic tail (from acyclic_len on) whole and unsplit.
+        let take_all = cursor >= acyclic_len;
+        while cursor < order.len()
+            && (take_all
+                || (cursor < acyclic_len && estimated < remaining && chunk.len() < max_chunk))
+        {
+            let node = order[cursor];
             cursor += 1;
-            if !in_chunk[n as usize] {
-                in_chunk[n as usize] = true;
-                estimated = estimated.saturating_add(graph.nar_sizes[n as usize]);
-                chunk.push(n);
-            }
+            estimated = estimated.saturating_add(graph.nar_sizes[node as usize]);
+            chunk.push(node);
         }
         if chunk.is_empty() {
             break;
-        }
-        // Close the chunk under dead referrers (see dead_referrers above).
-        if let Some(rev) = &dead_referrers {
-            let mut i = 0;
-            while i < chunk.len() {
-                for &r in &rev[chunk[i] as usize] {
-                    if !in_chunk[r as usize] {
-                        in_chunk[r as usize] = true;
-                        chunk.push(r);
-                    }
-                }
-                i += 1;
-            }
         }
         // Claim (mark pending) atomically with the protection check,
         // *before* invalidating DB rows. A protect() arriving later for a
@@ -436,7 +453,7 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
         // Invalidate rows before unlinking: builders trust isValidPath(),
         // so a path must never look valid after its disk entry is gone.
         // See alloy/gc_db_consistency.als.
-        db.invalidate_paths(claimed.iter().map(|&n| graph.paths[n as usize].as_str()))?;
+        db.invalidate_ids(claimed.iter().map(|&n| graph.ids[n as usize]))?;
         claimed.par_iter().for_each(|&node| {
             let path = &graph.paths[node as usize];
             let basename = path.strip_prefix(&store_prefix).unwrap_or(path);
@@ -452,7 +469,13 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
             }
             live.end_delete_node(node);
         });
-        paths_deleted.fetch_add(claimed.len() as u64, Ordering::Relaxed);
+        let done =
+            paths_deleted.fetch_add(claimed.len() as u64, Ordering::Relaxed) + claimed.len() as u64;
+        log::debug!(
+            "deleted {done}/{} dead paths, {} freed",
+            order.len(),
+            format_size(bytes_freed.load(Ordering::Relaxed)),
+        );
     }
 
     // Unknown-on-disk paths: also parallel. tmp-* dirs hold flock through

@@ -11,6 +11,7 @@ struct Args {
     ensure_free: Option<u64>,
     keep_recent: Option<String>,
     no_vacuum: bool,
+    chunk_size: Option<usize>,
     keep_outputs: Option<bool>,
     keep_derivations: Option<bool>,
     store_dir: PathBuf,
@@ -59,6 +60,9 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         println!("      --ensure-free SIZE        Free until SIZE is available (e.g. 50G)");
         println!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
         println!("      --no-vacuum               Skip the database VACUUM after deletion");
+        println!(
+            "      --chunk-size N            Dead paths per delete transaction [default: 65536]"
+        );
         println!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
         println!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
         println!("      --store-dir PATH          Nix store directory [default: /nix/store]");
@@ -77,6 +81,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         ensure_free: pargs.opt_value_from_fn("--ensure-free", parse_size)?,
         keep_recent: pargs.opt_value_from_str("--keep-recent")?,
         no_vacuum: pargs.contains("--no-vacuum"),
+        chunk_size: pargs.opt_value_from_str("--chunk-size")?,
         keep_outputs: pargs.opt_value_from_str("--keep-outputs")?,
         keep_derivations: pargs.opt_value_from_str("--keep-derivations")?,
         store_dir: pargs
@@ -98,6 +103,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
             "--ensure-free",
             "--keep-recent",
             "--no-vacuum",
+            "--chunk-size",
             "--keep-outputs",
             "--keep-derivations",
             "--store-dir",
@@ -191,6 +197,7 @@ fn main() -> Result<()> {
         max_freed,
         keep_recent_after,
         no_vacuum: args.no_vacuum,
+        chunk_size: args.chunk_size,
     };
     let (bytes_freed, paths_deleted) = gc::collect_garbage(&store, &opts)?;
 

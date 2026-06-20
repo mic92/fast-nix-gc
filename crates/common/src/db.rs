@@ -116,8 +116,10 @@ impl NixDb {
         let mut id_to_idx = vec![MISSING; (max_id as usize) + 1];
 
         let mut paths: Vec<String> = Vec::new();
+        let mut ids: Vec<i64> = Vec::new();
         let mut nar_sizes: Vec<u64> = Vec::new();
         let mut registration_times: Vec<i64> = Vec::new();
+        let t_nodes = std::time::Instant::now();
         {
             let mut stmt = self
                 .conn
@@ -133,17 +135,27 @@ impl NixDb {
                     id_to_idx[id as usize] = idx;
                 }
                 paths.push(path);
+                ids.push(id);
                 nar_sizes.push(nar.unwrap_or(0).max(0) as u64);
                 registration_times.push(reg_time);
             }
         }
 
+        log::debug!(
+            "loaded {} nodes in {:.1}s",
+            paths.len(),
+            t_nodes.elapsed().as_secs_f64()
+        );
+
         // CSR adjacency: flat target array + per-node offsets.
         let n = paths.len();
         let mut edges: Vec<(u32, u32)> = Vec::new();
+        let t_edges = std::time::Instant::now();
 
         let mut add_edges =
             |conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<()> {
+                let start = std::time::Instant::now();
+                let before = edges.len();
                 let mut stmt = conn.prepare(sql)?;
                 let mut rows = stmt.query(params)?;
                 while let Some(row) = rows.next()? {
@@ -155,6 +167,11 @@ impl NixDb {
                         edges.push((from, to));
                     }
                 }
+                log::debug!(
+                    "edge query took {:.1}s ({} edges): {sql}",
+                    start.elapsed().as_secs_f64(),
+                    edges.len() - before,
+                );
                 Ok(())
             };
 
@@ -228,6 +245,12 @@ impl NixDb {
             }
         }
 
+        log::debug!(
+            "loaded {} edges in {:.1}s",
+            edges.len(),
+            t_edges.elapsed().as_secs_f64()
+        );
+
         // CSR offsets are u32; refuse to build a graph the index type
         // cannot address instead of silently wrapping.
         anyhow::ensure!(
@@ -252,6 +275,7 @@ impl NixDb {
 
         Ok(StoreGraph {
             paths,
+            ids,
             nar_sizes,
             registration_times,
             ref_offsets,
@@ -292,23 +316,23 @@ impl NixDb {
         Ok(n > 0)
     }
 
-    /// Remove paths from the DB in a single transaction.
-    pub fn invalidate_paths<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Result<()> {
+    /// Remove paths by their ValidPaths.id in a single transaction. The
+    /// caller holds the ids from `load_graph`, so deletion is a rowid
+    /// insert into DeadPaths rather than a per-path index lookup.
+    pub fn invalidate_ids(&self, ids: impl Iterator<Item = i64>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         let result = (|| -> Result<()> {
-            // Collect the ids of paths to delete into a temp table so
-            // we can batch-delete their Refs in two statements instead
-            // of one subquery per path.
+            // Collect the dead ids in a temp table so their Refs can be
+            // batch-deleted in two statements instead of one subquery
+            // per path.
             self.conn.execute_batch(
                 "CREATE TEMP TABLE IF NOT EXISTS DeadPaths (id INTEGER PRIMARY KEY)",
             )?;
             self.conn.execute_batch("DELETE FROM DeadPaths")?;
             {
-                let mut ins = self
-                    .conn
-                    .prepare("INSERT INTO DeadPaths SELECT id FROM ValidPaths WHERE path = ?")?;
-                for p in paths {
-                    ins.execute([p])?;
+                let mut ins = self.conn.prepare("INSERT INTO DeadPaths VALUES (?)")?;
+                for id in ids {
+                    ins.execute([id])?;
                 }
             }
             // Delete reference edges involving dead paths first.
@@ -341,6 +365,11 @@ impl NixDb {
         match result {
             Ok(()) => {
                 self.conn.execute_batch("COMMIT")?;
+                // Truncate the WAL back to the main db so its disk use
+                // doesn't accumulate across chunks. On a full disk an
+                // unbounded WAL would abort a later chunk. Best effort:
+                // a blocked checkpoint just leaves the WAL for the next.
+                let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
                 Ok(())
             }
             Err(e) => {
@@ -364,10 +393,12 @@ impl NixDb {
             return Ok(false);
         }
         log::info!("vacuuming database ({freelist} of {pages} pages free)...");
+        let start = std::time::Instant::now();
         self.conn.execute_batch("VACUUM")?;
         // Best effort: a concurrent reader may block the WAL truncate;
         // the next checkpoint picks it up.
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        log::info!("vacuum done in {:.1}s", start.elapsed().as_secs_f64());
         Ok(true)
     }
 }
@@ -387,6 +418,9 @@ fn normalize_dir(dir: &Path) -> PathBuf {
 pub struct StoreGraph {
     /// node idx -> store path string
     pub paths: Vec<String>,
+    /// node idx -> ValidPaths.id (DB primary key). Lets invalidation
+    /// delete by rowid instead of re-resolving each path string.
+    pub ids: Vec<i64>,
     /// node idx -> narSize (bytes)
     pub nar_sizes: Vec<u64>,
     /// node idx -> registrationTime (Unix epoch seconds)
@@ -436,6 +470,7 @@ impl StoreGraph {
     pub fn empty(store_prefix: String) -> StoreGraph {
         StoreGraph {
             paths: Vec::new(),
+            ids: Vec::new(),
             nar_sizes: Vec::new(),
             registration_times: Vec::new(),
             ref_offsets: vec![0],
@@ -745,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_paths_handles_ref_cycles() {
+    fn invalidate_ids_handles_ref_cycles() {
         let t = setup();
         let a = add_path(&t.db, &format!("{H1}-a"), 1, 1);
         let b = add_path(&t.db, &format!("{H2}-b"), 1, 1);
@@ -755,9 +790,7 @@ mod tests {
         add_ref(&t.db, a, b);
         add_ref(&t.db, b, a);
 
-        let dead = [full(&format!("{H1}-a")), full(&format!("{H2}-b"))];
-        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
-            .unwrap();
+        t.db.invalidate_ids([a, b].into_iter()).unwrap();
 
         let remaining: Vec<String> =
             t.db.valid_store_paths()
@@ -774,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_paths_cascades_derivation_outputs() {
+    fn invalidate_ids_cascades_derivation_outputs() {
         let t = setup();
         let drv = add_path(&t.db, &format!("{H1}-pkg.drv"), 1, 1);
         let out = add_path(&t.db, &format!("{H2}-pkg"), 1, 1);
@@ -786,9 +819,7 @@ mod tests {
             .unwrap();
         let _ = out;
 
-        let dead = [full(&format!("{H1}-pkg.drv"))];
-        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
-            .unwrap();
+        t.db.invalidate_ids([drv].into_iter()).unwrap();
 
         let n: i64 =
             t.db.conn
@@ -798,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_paths_clears_realisations_with_restrict_fk() {
+    fn invalidate_ids_clears_realisations_with_restrict_fk() {
         // Nix ≤2.34 CA schema: RealisationsRefs.realisationReference is ON
         // DELETE RESTRICT. Bulk-deleting two dead paths whose realisations
         // reference each other must not trip the constraint.
@@ -830,9 +861,7 @@ mod tests {
             ))
             .unwrap();
 
-        let dead = [full(&format!("{H1}-a")), full(&format!("{H2}-b"))];
-        t.db.invalidate_paths(dead.iter().map(|s| s.as_str()))
-            .unwrap();
+        t.db.invalidate_ids([a, b].into_iter()).unwrap();
 
         for table in ["Realisations", "RealisationsRefs", "ValidPaths"] {
             let n: i64 =

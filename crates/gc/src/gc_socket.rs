@@ -379,6 +379,7 @@ mod tests {
         }
         StoreGraph {
             paths: paths.iter().map(|(p, _)| format!("{prefix}{p}")).collect(),
+            ids: (0..n as i64).collect(),
             nar_sizes: vec![0; n],
             registration_times: vec![0; n],
             ref_offsets,

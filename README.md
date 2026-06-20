@@ -23,6 +23,7 @@ fast-nix-gc [OPTIONS]
       --ensure-free SIZE        Free until SIZE is available (e.g. 50G)
       --keep-recent SPEC        Keep paths registered within SPEC (e.g. 1d)
       --no-vacuum               Skip the database VACUUM after deletion
+      --chunk-size N            Dead paths per delete transaction [default: 65536]
       --keep-outputs BOOL       Override the keep-outputs nix.conf setting
       --keep-derivations BOOL   Override the keep-derivations nix.conf setting
       --store-dir PATH          Nix store directory [default: /nix/store]
@@ -32,10 +33,10 @@ fast-nix-gc [OPTIONS]
 ## fast-nix-optimise
 
 Hardlink-based store dedup, on-disk compatible with `nix-store --optimise`:
-same `.links/` layout, same NAR-SHA-256 filenames, the two can be mixed
-freely. Hashing and linking run as concurrent tokio tasks; a steady-state
-store where most files are already deduped is skipped via `d_ino` from
-readdir without rehashing. ~2x faster than upstream on a warm store.
+It uses the same `.links/` layout and the same NAR-SHA-256 filenames
+Hashing and linking run as concurrent tokio tasks.
+An already deduped store is skipped via `d_ino` from readdir without rehashing.
+We measured ~2x faster than upstream on a warm store.
 
 ```
 fast-nix-optimise [OPTIONS]
@@ -49,9 +50,8 @@ fast-nix-optimise [OPTIONS]
 
 Both tools take a shared `gc.lock` so they don't race each other or Nix.
 While fast-nix-gc deletes, it serves the GC roots socket
-(`state/gc-socket/socket`, same protocol as `nix-store --gc`), so concurrent
-`nix build`s register temp roots without blocking on the lock.
-`--store-dir`/`--state-dir` let you point at a separate store for testing.
+(`state/gc-socket/socket` same as `nix-store --gc`).
+A concurrent `nix build`s register temp roots without blocking on the lock.
 
 ## NixOS module
 
@@ -99,6 +99,7 @@ Replaces `nix.gc` and `nix.optimise`:
 | `ensureFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
 | `keepRecent` | `null` | Pin paths registered within e.g. `"1d"` |
 | `noVacuum` | `false` | Skip the post-GC database VACUUM (see below) |
+| `chunkSize` | `null` | Dead paths per delete transaction (default 65536) |
 | `package` | this flake's package | Override the binary |
 | `extraArgs` | `[ ]` | Extra CLI arguments |
 
@@ -122,14 +123,43 @@ Without flakes, import `nix/module.nix` directly.
 
 After deleting dead paths, fast-nix-gc runs `VACUUM` when at least a
 quarter of the database is free pages. In WAL mode this rewrites the
-entire database through the write-ahead log, and SQLite cannot truncate
+entire database through the write-ahead log. SQLite cannot truncate
 the resulting database-sized `db.sqlite-wal` while any connection holds
 a read snapshot. This is the reason Nix disabled GC vacuuming in commit
 [`8299aaf`](https://github.com/NixOS/nix/commit/8299aaf07988a3ca7ecda3526b7e25a885550db5).
 
-On builders that are never idle, enable `--no-vacuum`: the free pages
-stay in `db.sqlite` and are reused for new registrations, and a later GC
-on a quiet system reclaims the space.
+On builders that are never idle, enable `--no-vacuum`. The free pages
+stay in `db.sqlite` and are reused for new registrations.
+A later GC on a quiet system reclaims the space.
+
+### Tuning `--chunk-size` / `chunkSize`
+
+Dead paths are invalidated in batches, one SQLite transaction per batch,
+with the write-ahead log truncated after each. The batch size trades disk
+headroom against checkpoint overhead:
+
+- **Smaller** keeps each transaction's `db.sqlite-wal` small. A single
+  transaction over the whole dead set grows the WAL until commit.
+  On a full disk that aborts with `SQLITE_FULL` and frees nothing.
+  Chunking bounds the WAL and reclaims space incrementally.
+- **Larger** means fewer transactions and fewer checkpoint `fsync`s, so
+  deletion runs faster, at the cost of a larger transient WAL.
+
+As a rule of thumb, deleting a path dirties scattered B-tree pages across
+the references table and its indexes, costing very roughly 10 KiB of WAL
+per dead path on a large, cold store, so a batch's WAL is about
+`chunk-size × 10 KiB`. The default of 65536 keeps it near 640 MiB, safe on
+all but a nearly full disk. With tens of GiB free, `--chunk-size 262144`
+(~2.5 GiB WAL) cuts the checkpoint count ~4x.
+Only higher when you have enough free disk space,
+since the WAL grows linearly with the batch size.
+
+The truncation after each batch can only reclaim WAL frames older than the
+oldest live read snapshot. A long-running reader i.e. `nix-daemon` pins those frames,
+so the WAL keeps growing across batches regardless of `--chunk-size`, potentially until the disk fills.
+For a large GC on a tight disk stop `nix-daemon` (and any other store reader) first, or
+keep the chunk size small enough that even an unreclaimed WAL fits the free
+space.
 
 ## Building
 
@@ -157,14 +187,16 @@ Two fuzzers back the behavioral claims below:
 Roots are gathered from `gcroots/`, `profiles/`, `temproots/`, and running
 processes (`/proc` on Linux; `libproc` syscalls on macOS instead of
 shelling out to `lsof`). Stale temp-root files and dangling auto-roots are
-removed. `keep-derivations` and `keep-outputs` are honored with the same
+removed. `tmp-*` build dirs are skipped if a builder still holds the lock.
+
+`keep-derivations` and `keep-outputs` are honored with the same
 edge semantics as `nix-store --gc`: an alive output keeps its derivation
 (`keep-derivations`), an alive derivation keeps its outputs
 (`keep-outputs`). This includes content-addressed / dynamic derivations:
 drv↔output mappings are read from `ValidPaths.deriver`,
-`DerivationOutputs`, and the `BuildTraceV3` table (Nix ≥2.35). The
-store is remounted read-write on NixOS where it's bind-mounted read-only.
-`tmp-*` build dirs are skipped if a builder still holds the lock.
+`DerivationOutputs`, and the `BuildTraceV3` table (Nix ≥2.35).
+
+The store is remounted read-write on NixOS where it's bind-mounted read-only.
 
 ### Database vacuum
 
@@ -228,5 +260,5 @@ controlled measurement.
 The speedup grows with store size: stock `nix-gc` pays a large fixed cost
 walking the whole live closure even when there's almost nothing to delete
 (near-idle runs still took minutes on the bigger machines), while
-`fast-nix-gc` stays in the single-digit-seconds range. On a tiny store
-the overhead is negligible either way and the two are roughly comparable.
+`fast-nix-gc` stays in the single-digit-seconds range.
+On a tiny store the overhead is negligible either way and the two are roughly comparable.
