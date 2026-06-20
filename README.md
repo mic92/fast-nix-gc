@@ -33,10 +33,10 @@ fast-nix-gc [OPTIONS]
 ## fast-nix-optimise
 
 Hardlink-based store dedup, on-disk compatible with `nix-store --optimise`:
-same `.links/` layout, same NAR-SHA-256 filenames, the two can be mixed
-freely. Hashing and linking run as concurrent tokio tasks; a steady-state
-store where most files are already deduped is skipped via `d_ino` from
-readdir without rehashing. ~2x faster than upstream on a warm store.
+It uses the same `.links/` layout and the same NAR-SHA-256 filenames
+Hashing and linking run as concurrent tokio tasks.
+An already deduped store is skipped via `d_ino` from readdir without rehashing.
+We measured ~2x faster than upstream on a warm store.
 
 ```
 fast-nix-optimise [OPTIONS]
@@ -50,9 +50,8 @@ fast-nix-optimise [OPTIONS]
 
 Both tools take a shared `gc.lock` so they don't race each other or Nix.
 While fast-nix-gc deletes, it serves the GC roots socket
-(`state/gc-socket/socket`, same protocol as `nix-store --gc`), so concurrent
-`nix build`s register temp roots without blocking on the lock.
-`--store-dir`/`--state-dir` let you point at a separate store for testing.
+(`state/gc-socket/socket` same as `nix-store --gc`).
+A concurrent `nix build`s register temp roots without blocking on the lock.
 
 ## NixOS module
 
@@ -124,14 +123,14 @@ Without flakes, import `nix/module.nix` directly.
 
 After deleting dead paths, fast-nix-gc runs `VACUUM` when at least a
 quarter of the database is free pages. In WAL mode this rewrites the
-entire database through the write-ahead log, and SQLite cannot truncate
+entire database through the write-ahead log. SQLite cannot truncate
 the resulting database-sized `db.sqlite-wal` while any connection holds
 a read snapshot. This is the reason Nix disabled GC vacuuming in commit
 [`8299aaf`](https://github.com/NixOS/nix/commit/8299aaf07988a3ca7ecda3526b7e25a885550db5).
 
-On builders that are never idle, enable `--no-vacuum`: the free pages
-stay in `db.sqlite` and are reused for new registrations, and a later GC
-on a quiet system reclaims the space.
+On builders that are never idle, enable `--no-vacuum`. The free pages
+stay in `db.sqlite` and are reused for new registrations.
+A later GC on a quiet system reclaims the space.
 
 ### Tuning `--chunk-size` / `chunkSize`
 
@@ -188,14 +187,16 @@ Two fuzzers back the behavioral claims below:
 Roots are gathered from `gcroots/`, `profiles/`, `temproots/`, and running
 processes (`/proc` on Linux; `libproc` syscalls on macOS instead of
 shelling out to `lsof`). Stale temp-root files and dangling auto-roots are
-removed. `keep-derivations` and `keep-outputs` are honored with the same
+removed. `tmp-*` build dirs are skipped if a builder still holds the lock.
+
+`keep-derivations` and `keep-outputs` are honored with the same
 edge semantics as `nix-store --gc`: an alive output keeps its derivation
 (`keep-derivations`), an alive derivation keeps its outputs
 (`keep-outputs`). This includes content-addressed / dynamic derivations:
 drv↔output mappings are read from `ValidPaths.deriver`,
-`DerivationOutputs`, and the `BuildTraceV3` table (Nix ≥2.35). The
-store is remounted read-write on NixOS where it's bind-mounted read-only.
-`tmp-*` build dirs are skipped if a builder still holds the lock.
+`DerivationOutputs`, and the `BuildTraceV3` table (Nix ≥2.35).
+
+The store is remounted read-write on NixOS where it's bind-mounted read-only.
 
 ### Database vacuum
 
@@ -259,5 +260,5 @@ controlled measurement.
 The speedup grows with store size: stock `nix-gc` pays a large fixed cost
 walking the whole live closure even when there's almost nothing to delete
 (near-idle runs still took minutes on the bigger machines), while
-`fast-nix-gc` stays in the single-digit-seconds range. On a tiny store
-the overhead is negligible either way and the two are roughly comparable.
+`fast-nix-gc` stays in the single-digit-seconds range.
+On a tiny store the overhead is negligible either way and the two are roughly comparable.
