@@ -4,12 +4,17 @@
     url = "github:numtide/treefmt-nix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  inputs.nix-darwin = {
+    url = "github:nix-darwin/nix-darwin";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
     {
       self,
       nixpkgs,
       treefmt-nix,
+      nix-darwin,
       ...
     }:
     let
@@ -42,6 +47,14 @@
       nixosModules.default = ./nix/module.nix;
       darwinModules.default = ./nix/darwin-module.nix;
 
+      # Activated on a macOS runner; see the darwin-module workflow.
+      darwinConfigurations.ci = import ./nix/darwin-test.nix {
+        system = "aarch64-darwin";
+        darwin = nix-darwin;
+        darwinModule = self.darwinModules.default;
+        activate = true;
+      };
+
       checks = forAllSystems (
         system:
         let
@@ -55,6 +68,14 @@
         // nixpkgs.lib.mapAttrs' (n: nixpkgs.lib.nameValuePair "devshell-${n}") self.devShells.${system}
         // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-test = import ./nix/nixos-test.nix { inherit pkgs; };
+        }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+          darwin-module =
+            (import ./nix/darwin-test.nix {
+              inherit system;
+              darwin = nix-darwin;
+              darwinModule = self.darwinModules.default;
+            }).system;
         }
       );
 

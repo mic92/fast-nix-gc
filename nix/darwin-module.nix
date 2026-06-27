@@ -70,8 +70,12 @@ in
         StartCalendarInterval = lib.mkIf cfg.automatic cfg.startCalendarInterval;
         # `nix config show` for keep-derivations/keep-outputs. Raw
         # ProgramArguments bypass nix-darwin's `path` wrapper, so put nix
-        # on PATH explicitly.
-        EnvironmentVariables.PATH = "${config.nix.package}/bin";
+        # on PATH explicitly. When nix-darwin does not manage nix (an
+        # external installer), config.nix.package is unavailable, so fall
+        # back to the standard profile/installer locations.
+        EnvironmentVariables.PATH =
+          lib.optionalString config.nix.enable "${config.nix.package}/bin:"
+          + "/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin";
       };
     })
 
