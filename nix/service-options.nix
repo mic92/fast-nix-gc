@@ -76,6 +76,17 @@ in
       '';
     };
 
+    gcRootsDirs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "/mnt/extra-roots" ];
+      description = ''
+        Extra directories to scan for GC roots, treated like the standard
+        gcroots directory. Nix only scans its own state directories; this
+        keeps roots that live elsewhere from being collected.
+      '';
+    };
+
     extraArgs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
@@ -152,6 +163,10 @@ in
       "--chunk-size"
       (toString cfg.chunkSize)
     ]
+    ++ lib.concatMap (d: [
+      "--gc-roots-dir"
+      d
+    ]) cfg.gcRootsDirs
     ++ cfg.extraArgs;
 
     services.fast-nix-optimise.argv = [

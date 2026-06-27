@@ -14,6 +14,7 @@ struct Args {
     chunk_size: Option<usize>,
     keep_outputs: Option<bool>,
     keep_derivations: Option<bool>,
+    gc_roots_dirs: Vec<PathBuf>,
     store_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -102,6 +103,9 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         );
         println!("      --keep-outputs BOOL       Override the keep-outputs nix.conf setting");
         println!("      --keep-derivations BOOL   Override the keep-derivations nix.conf setting");
+        println!(
+            "      --gc-roots-dir PATH       Extra directory to scan for GC roots (repeatable)"
+        );
         println!("      --store-dir PATH          Nix store directory [default: /nix/store]");
         println!("      --state-dir PATH          Nix state directory [default: /nix/var/nix]");
         std::process::exit(0);
@@ -121,6 +125,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         chunk_size: pargs.opt_value_from_str("--chunk-size")?,
         keep_outputs: pargs.opt_value_from_str("--keep-outputs")?,
         keep_derivations: pargs.opt_value_from_str("--keep-derivations")?,
+        gc_roots_dirs: pargs.values_from_str("--gc-roots-dir")?,
         store_dir: pargs
             .opt_value_from_str("--store-dir")?
             .unwrap_or_else(|| PathBuf::from("/nix/store")),
@@ -143,6 +148,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
             "--chunk-size",
             "--keep-outputs",
             "--keep-derivations",
+            "--gc-roots-dir",
             "--store-dir",
             "--state-dir",
             "--help",
@@ -236,6 +242,7 @@ fn main() -> Result<()> {
         keep_recent_after,
         no_vacuum: args.no_vacuum,
         chunk_size: args.chunk_size,
+        extra_gc_roots_dirs: args.gc_roots_dirs,
     };
     let (bytes_freed, paths_deleted) = gc::collect_garbage(&store, &opts)?;
 
