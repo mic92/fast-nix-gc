@@ -26,6 +26,7 @@ fast-nix-gc [OPTIONS]
       --chunk-size N            Dead paths per delete transaction [default: 65536]
       --keep-outputs BOOL       Override the keep-outputs nix.conf setting
       --keep-derivations BOOL   Override the keep-derivations nix.conf setting
+      --gc-roots-dir PATH       Extra directory to scan for GC roots (repeatable)
       --store-dir PATH          Nix store directory [default: /nix/store]
       --state-dir PATH          Nix state directory [default: /nix/var/nix]
 ```
@@ -100,6 +101,7 @@ Replaces `nix.gc` and `nix.optimise`:
 | `keepRecent` | `null` | Pin paths registered within e.g. `"1d"` |
 | `noVacuum` | `false` | Skip the post-GC database VACUUM (see below) |
 | `chunkSize` | `null` | Dead paths per delete transaction (default 65536) |
+| `gcRootsDirs` | `[ ]` | Extra directories to scan for GC roots, e.g. `[ "/mnt/extra-roots" ]` |
 | `package` | this flake's package | Override the binary |
 | `extraArgs` | `[ ]` | Extra CLI arguments |
 
@@ -118,6 +120,26 @@ Replaces `nix.gc` and `nix.optimise`:
 | `extraArgs` | `[ ]` | Extra CLI arguments |
 
 Without flakes, import `nix/module.nix` directly.
+
+### nix-darwin
+
+`darwinModules.default` exposes the same `services.fast-nix-gc` and
+`services.fast-nix-optimise` options, run as launchd daemons. Scheduling
+uses launchd's `startCalendarInterval` (a list of
+`launchd.plist(5)` StartCalendarInterval entries) instead of `dates`:
+
+```nix
+fast-nix-gc.darwinModules.default
+{
+  services.fast-nix-gc = {
+    enable = true;
+    automatic = true;
+    startCalendarInterval = [ { Hour = 3; Minute = 15; } ];
+    deleteOlderThan = "30d";
+    ensureFree = "50G";
+  };
+}
+```
 
 ### When to use `--no-vacuum` / `noVacuum`
 

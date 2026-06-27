@@ -1,0 +1,42 @@
+name: Darwin module
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+  checks: read
+jobs:
+  darwin-module:
+    # macos-latest is arm64 -> aarch64-darwin
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Wait for nixbot (buildbot) to finish so we don't duplicate work or
+      # run before the main eval has passed. Runs in the PR's own
+      # unprivileged context, so no secrets/cache exposure for fork PRs.
+      - name: Wait for nixbot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/wait-for-buildbot.sh "${{ github.event.pull_request.head.sha || github.sha }}"
+      - uses: NixOS/nix-installer-action@main
+        with:
+          extra-conf: |
+            extra-substituters = https://cache.thalheim.io
+            extra-trusted-public-keys = cache.thalheim.io-1:R7msbosLEZKrxk/lKxf9BTjOOH7Ax3H0Qj0/6wiHOgc=
+      - uses: Mic92/hestia@v1
+      # Build coverage: evaluates the module and builds the system closure.
+      - run: nix build --print-build-logs '.#checks.aarch64-darwin.darwin-module'
+      # nix-darwin refuses to overwrite the runner's pre-existing shell
+      # rc files; mark them as backups so activation can take over.
+      - name: Prepare /etc for nix-darwin
+        run: |
+          for f in /etc/bashrc /etc/zshrc /etc/zshenv /etc/bash.bashrc; do
+            [ -e "$f" ] && sudo mv "$f" "$f.before-nix-darwin" || true
+          done
+      # Activation coverage: install the launchd daemons on the runner.
+      - run: sudo nix run github:nix-darwin/nix-darwin -- switch --flake '.#ci'
+      - name: Verify launchd daemons are loaded
+        run: |
+          sudo launchctl print system/org.nixos.fast-nix-gc
+          sudo launchctl print system/org.nixos.fast-nix-optimise

@@ -131,6 +131,9 @@ pub struct GcOptions {
     /// WAL (and its disk use) lower; larger means fewer checkpoints.
     /// None uses the default.
     pub chunk_size: Option<usize>,
+    /// Extra directories scanned for GC roots, like `gcroots`. Nix only
+    /// scans its fixed state dirs, so roots outside them go uncounted.
+    pub extra_gc_roots_dirs: Vec<std::path::PathBuf>,
 }
 
 /// Main GC: find roots, compute alive closure, delete dead paths.
@@ -227,7 +230,12 @@ pub fn collect_garbage(db: &NixDb, opts: &GcOptions) -> Result<(u64, usize)> {
     }
 
     log::info!("finding garbage collector roots...");
-    let mut roots = find_roots(&db.state_dir, &db.store_dir, &bidx)?;
+    let mut roots = find_roots(
+        &db.state_dir,
+        &db.store_dir,
+        &opts.extra_gc_roots_dirs,
+        &bidx,
+    )?;
     roots.extend(early_root_idxs);
 
     // Add temp roots. Some may reference paths registered after our

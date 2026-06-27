@@ -5,18 +5,24 @@ use crate::HashSet;
 use crate::db::BasenameIndex;
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Find all GC root node indices by walking gcroots/profiles directories
-/// and scanning running processes.
-pub fn find_roots(state_dir: &Path, store_dir: &Path, idx: &BasenameIndex) -> Result<Vec<u32>> {
+/// (plus any `extra_dirs`) and scanning running processes.
+pub fn find_roots(
+    state_dir: &Path,
+    store_dir: &Path,
+    extra_dirs: &[PathBuf],
+    idx: &BasenameIndex,
+) -> Result<Vec<u32>> {
     let mut roots = HashSet::default();
     let store_prefix = store_dir.to_string_lossy().to_string();
 
     // Errors here must abort the GC: silently dropping a roots directory
     // (e.g. EACCES) would let the GC delete live paths.
-    for dir in [state_dir.join("gcroots"), state_dir.join("profiles")] {
-        find_roots_in_dir(&dir, &store_prefix, idx, &mut roots)
+    let default_dirs = [state_dir.join("gcroots"), state_dir.join("profiles")];
+    for dir in default_dirs.iter().chain(extra_dirs.iter()) {
+        find_roots_in_dir(dir, &store_prefix, idx, &mut roots)
             .with_context(|| format!("scanning roots in {}", dir.display()))?;
     }
 
@@ -738,8 +744,47 @@ pub fn find_temp_roots(state_dir: &Path) -> Result<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{BasenameIndex, StoreGraph};
 
     const HASH: &str = "abcdefghijklmnopqrstuvwxyz012345"; // 32 chars
+
+    fn graph(paths: &[&str]) -> StoreGraph {
+        let n = paths.len();
+        StoreGraph {
+            paths: paths.iter().map(|p| format!("/nix/store/{p}")).collect(),
+            ids: (0..n as i64).collect(),
+            nar_sizes: vec![0; n],
+            registration_times: vec![0; n],
+            ref_offsets: vec![0; n + 1],
+            ref_targets: Vec::new(),
+            store_prefix: "/nix/store/".to_owned(),
+        }
+    }
+
+    #[test]
+    fn find_roots_scans_extra_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir_all(state.join("gcroots")).unwrap();
+        fs::create_dir_all(state.join("profiles")).unwrap();
+        let extra = tmp.path().join("extra-roots");
+        fs::create_dir_all(&extra).unwrap();
+
+        let target = format!("/nix/store/{HASH}-foo");
+        std::os::unix::fs::symlink(&target, extra.join("link")).unwrap();
+
+        let g = graph(&[&format!("{HASH}-foo")]);
+        let idx = BasenameIndex::new(&g);
+        let store_dir = Path::new("/nix/store");
+
+        // Without the extra dir the symlink is invisible.
+        let roots = find_roots(&state, store_dir, &[], &idx).unwrap();
+        assert!(roots.is_empty(), "{roots:?}");
+
+        // With it, the symlink target becomes a root.
+        let roots = find_roots(&state, store_dir, &[extra], &idx).unwrap();
+        assert_eq!(roots, vec![0], "{roots:?}");
+    }
 
     #[test]
     fn store_path_basename_grammar() {
