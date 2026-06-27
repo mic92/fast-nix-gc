@@ -8,7 +8,7 @@ struct Args {
     delete_old: bool,
     delete_older_than: Option<String>,
     dry_run: bool,
-    ensure_free: Option<u64>,
+    ensure_free: Option<EnsureFree>,
     keep_recent: Option<String>,
     no_vacuum: bool,
     chunk_size: Option<usize>,
@@ -16,6 +16,40 @@ struct Args {
     keep_derivations: Option<bool>,
     store_dir: PathBuf,
     state_dir: PathBuf,
+}
+
+/// `--ensure-free` target: absolute bytes or a percentage of the store's
+/// filesystem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EnsureFree {
+    Bytes(u64),
+    Percent(f64),
+}
+
+impl EnsureFree {
+    fn target_bytes(self, total: u64) -> u64 {
+        match self {
+            EnsureFree::Bytes(b) => b,
+            EnsureFree::Percent(p) => (total as f64 * p / 100.0) as u64,
+        }
+    }
+}
+
+/// Parse a size like "50G" or a percentage like "20%".
+fn parse_ensure_free(s: &str) -> Result<EnsureFree> {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix('%') {
+        let p: f64 = num
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid percentage '{s}'"))?;
+        if !p.is_finite() || !(0.0..=100.0).contains(&p) {
+            bail!("percentage '{s}' must be between 0 and 100");
+        }
+        Ok(EnsureFree::Percent(p))
+    } else {
+        Ok(EnsureFree::Bytes(parse_size(s)?))
+    }
 }
 
 /// Parse a size like "50G", "512M", "1024K", or plain bytes.
@@ -35,12 +69,15 @@ fn parse_size(s: &str) -> Result<u64> {
     Ok((n * mult as f64) as u64)
 }
 
-/// Free bytes on the filesystem containing `path`.
-fn available_bytes(path: &Path) -> Result<u64> {
+/// Free and total bytes on the filesystem containing `path`.
+fn filesystem_bytes(path: &Path) -> Result<(u64, u64)> {
     let st =
         nix::sys::statvfs::statvfs(path).with_context(|| format!("statvfs {}", path.display()))?;
     // statvfs field types differ between Linux (u64) and macOS (u32).
-    Ok(st.blocks_available() as u64 * st.fragment_size() as u64)
+    let frag = st.fragment_size() as u64;
+    let avail = st.blocks_available() as u64 * frag;
+    let total = st.blocks() as u64 * frag;
+    Ok((avail, total))
 }
 
 fn parse_args() -> Result<Args> {
@@ -57,7 +94,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         println!("  -d, --delete-old              Remove old profile generations");
         println!("      --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d)");
         println!("      --dry-run                 Show what would be done");
-        println!("      --ensure-free SIZE        Free until SIZE is available (e.g. 50G)");
+        println!("      --ensure-free SIZE        Free until SIZE is available (e.g. 50G or 20%)");
         println!("      --keep-recent SPEC        Keep paths registered within SPEC (e.g. 7d)");
         println!("      --no-vacuum               Skip the database VACUUM after deletion");
         println!(
@@ -78,7 +115,7 @@ fn parse_args_from(args: Vec<std::ffi::OsString>) -> Result<Args> {
         delete_old,
         delete_older_than,
         dry_run: pargs.contains("--dry-run"),
-        ensure_free: pargs.opt_value_from_fn("--ensure-free", parse_size)?,
+        ensure_free: pargs.opt_value_from_fn("--ensure-free", parse_ensure_free)?,
         keep_recent: pargs.opt_value_from_str("--keep-recent")?,
         no_vacuum: pargs.contains("--no-vacuum"),
         chunk_size: pargs.opt_value_from_str("--chunk-size")?,
@@ -158,8 +195,9 @@ fn main() -> Result<()> {
             })?;
     }
 
-    let max_freed = if let Some(target) = args.ensure_free {
-        let avail = available_bytes(&args.store_dir)?;
+    let max_freed = if let Some(ensure_free) = args.ensure_free {
+        let (avail, total) = filesystem_bytes(&args.store_dir)?;
+        let target = ensure_free.target_bytes(total);
         if avail >= target {
             println!("{} already free, nothing to do", format_size(avail));
             return Ok(());
@@ -218,7 +256,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args_from, parse_size};
+    use super::{EnsureFree, parse_args_from, parse_ensure_free, parse_size};
 
     fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
         list.iter().map(|s| s.into()).collect()
@@ -255,5 +293,26 @@ mod tests {
         assert!(parse_size("inf").is_err());
         assert!(parse_size("NaN").is_err());
         assert!(parse_size("99999999999999999999G").is_err());
+    }
+
+    #[test]
+    fn parse_ensure_free_values() {
+        assert_eq!(
+            parse_ensure_free("50G").unwrap(),
+            EnsureFree::Bytes(50 * 1024u64.pow(3))
+        );
+        assert_eq!(parse_ensure_free("1024").unwrap(), EnsureFree::Bytes(1024));
+        assert_eq!(parse_ensure_free("20%").unwrap(), EnsureFree::Percent(20.0));
+        assert_eq!(
+            parse_ensure_free(" 12.5 % ").unwrap(),
+            EnsureFree::Percent(12.5)
+        );
+        assert_eq!(
+            parse_ensure_free("100%").unwrap(),
+            EnsureFree::Percent(100.0)
+        );
+        assert!(parse_ensure_free("101%").is_err());
+        assert!(parse_ensure_free("-5%").is_err());
+        assert!(parse_ensure_free("abc%").is_err());
     }
 }

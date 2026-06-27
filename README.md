@@ -20,7 +20,7 @@ fast-nix-gc [OPTIONS]
   -d, --delete-old              Remove old profile generations
       --delete-older-than SPEC  Delete generations older than SPEC (e.g. 30d, 4h)
       --dry-run                 Show what would be done
-      --ensure-free SIZE        Free until SIZE is available (e.g. 50G)
+      --ensure-free SIZE        Free until SIZE is available (e.g. 50G or 20%)
       --keep-recent SPEC        Keep paths registered within SPEC (e.g. 1d)
       --no-vacuum               Skip the database VACUUM after deletion
       --chunk-size N            Dead paths per delete transaction [default: 65536]
@@ -96,7 +96,7 @@ Replaces `nix.gc` and `nix.optimise`:
 | `randomizedDelaySec` | `"0"` | Random delay before each run |
 | `persistent` | `true` | Run on next boot if a scheduled run was missed |
 | `deleteOlderThan` | `null` | Remove profile generations older than e.g. `"30d"` |
-| `ensureFree` | `null` | Stop once this much disk is free, e.g. `"50G"` |
+| `ensureFree` | `null` | Stop once this much disk is free, e.g. `"50G"` or `"20%"` of the store's filesystem |
 | `keepRecent` | `null` | Pin paths registered within e.g. `"1d"` |
 | `noVacuum` | `false` | Skip the post-GC database VACUUM (see below) |
 | `chunkSize` | `null` | Dead paths per delete transaction (default 65536) |
