@@ -40,6 +40,7 @@
       );
 
       nixosModules.default = ./nix/module.nix;
+      darwinModules.default = ./nix/darwin-module.nix;
 
       checks = forAllSystems (
         system:

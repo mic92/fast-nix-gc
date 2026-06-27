@@ -119,6 +119,26 @@ Replaces `nix.gc` and `nix.optimise`:
 
 Without flakes, import `nix/module.nix` directly.
 
+### nix-darwin
+
+`darwinModules.default` exposes the same `services.fast-nix-gc` and
+`services.fast-nix-optimise` options, run as launchd daemons. Scheduling
+uses launchd's `startCalendarInterval` (a list of
+`launchd.plist(5)` StartCalendarInterval entries) instead of `dates`:
+
+```nix
+fast-nix-gc.darwinModules.default
+{
+  services.fast-nix-gc = {
+    enable = true;
+    automatic = true;
+    startCalendarInterval = [ { Hour = 3; Minute = 15; } ];
+    deleteOlderThan = "30d";
+    ensureFree = "50G";
+  };
+}
+```
+
 ### When to use `--no-vacuum` / `noVacuum`
 
 After deleting dead paths, fast-nix-gc runs `VACUUM` when at least a
