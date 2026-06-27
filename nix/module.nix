@@ -60,7 +60,11 @@ in
       type = lib.types.nullOr lib.types.singleLineStr;
       default = null;
       example = "50G";
-      description = "Free space until this much is available, then stop.";
+      description = ''
+        Free space until this much is available, then stop. Accepts an
+        absolute size like "50G" or a percentage of the store's filesystem
+        like "20%".
+      '';
     };
 
     keepRecent = lib.mkOption {
