@@ -10,7 +10,7 @@
   };
 
   outputs =
-    {
+    inputs@{
       self,
       nixpkgs,
       treefmt-nix,
@@ -63,6 +63,10 @@
         {
           proptest = pkgs.callPackage ./nix/proptest.nix { };
           treefmt = (import ./nix/treefmt.nix { inherit pkgs treefmt-nix; }).config.build.check ./.;
+          # Realize the flake inputs so the binary cache holds their
+          # source trees; later runs fetch from the cache instead of
+          # re-downloading.
+          flake-inputs = pkgs.linkFarm "flake-inputs" (builtins.removeAttrs inputs [ "self" ]);
         }
         // nixpkgs.lib.mapAttrs' (n: nixpkgs.lib.nameValuePair "package-${n}") self.packages.${system}
         // nixpkgs.lib.mapAttrs' (n: nixpkgs.lib.nameValuePair "devshell-${n}") self.devShells.${system}
