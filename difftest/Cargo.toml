@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 pico-args.workspace = true
-rand = "0.10"
+rand.workspace = true
 rusqlite.workspace = true
 
 [[bin]]

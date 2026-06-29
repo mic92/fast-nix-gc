@@ -17,6 +17,7 @@ log.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 harmonia-store-db.workspace = true
+rand.workspace = true
 
 [[bench]]
 name = "gc_bench"

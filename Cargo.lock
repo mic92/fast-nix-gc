@@ -369,6 +369,7 @@ dependencies = [
  "log",
  "nix",
  "pico-args",
+ "rand 0.10.1",
  "rayon",
  "rusqlite",
  "tempfile",
